@@ -1,0 +1,70 @@
+[workspace]
+members = [
+    "crates/app-server",
+    "crates/context",
+    "crates/deepseek",
+    "crates/planning",
+    "crates/plugins",
+    "crates/session",
+    "crates/swarm",
+    "crates/tui-core",
+]
+
+resolver = "2"
+
+[workspace.package]
+version = "0.8.21"
+edition = "2024"
+license = "MIT"
+repository = "https://github.com/Daigtas/DeepSeek-TUI-fork"
+
+[workspace.dependencies]
+anyhow = "1"
+async-trait = "0.1"
+axum = "0.8"
+chrono = { version = "0.4", features = ["serde"] }
+clap = { version = "4", features = ["derive"] }
+flate2 = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+smallvec = "1"
+tar = "0.4"
+tempfile = "3"
+tokio = { version = "1", features = ["full"] }
+tower-http = { version = "0.6", features = ["cors"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+uuid = { version = "1", features = ["v4"] }
+walkdir = "2"
+
+# Intra-workspace dependencies are versioned in each crate's Cargo.toml;
+# these entries serve as a single-point version constraint.
+deepseek-app-server = { path = "crates/app-server", version = "0.8.21" }
+deepseek-session = { path = "crates/session", version = "0.8.21" }
+deepseek-swarm = { path = "crates/swarm", version = "0.8.21" }
+deepseek-tui-core = { path = "crates/tui-core", version = "0.8.21" }
+deepseek-context = { path = "crates/context", version = "0.8.21" }
+deepseek-planning = { path = "crates/planning", version = "0.8.21" }
+deepseek-plugins = { path = "crates/plugins", version = "0.8.21" }
+
+# External crate dependencies referenced by workspace members.
+# Crate-local Cargo.toml files list the concrete dep name; this section
+# holds the version so it stays in one place.
+deepseek-agent = { version = "0.8.24" }
+deepseek-config = { version = "0.8.24" }
+deepseek-core = { version = "0.8.24" }
+deepseek-execpolicy = { version = "0.8.24" }
+deepseek-hooks = { version = "0.8.24" }
+deepseek-mcp = { version = "0.8.24" }
+deepseek-protocol = { version = "0.8.24" }
+deepseek-state = { version = "0.8.24" }
+deepseek-tools = { version = "0.8.24" }
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+strip = "symbols"
+
+[profile.dev]
+opt-level = 1

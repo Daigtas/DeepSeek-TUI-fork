@@ -1,241 +1,195 @@
-# DeepSeek TUI Lightweight installer
+# DeepSeek TUI (Fork)
 
-> Terminal coding agent for DeepSeek V4. It runs from the `deepseek` command, streams reasoning blocks, edits local workspaces with approval gates, and includes an auto mode that chooses both model and thinking level per turn.
+> AI-powered terminal workspace with **daemon mode**, **swarm orchestration**, **session persistence**, and **hybrid context storage** — built on DeepSeek V4.
 
-<div align="center">
-  <a href="../../releases/latest">
-    <img width="1200" alt="DeepSeek TUI Lightweight installer." src="assets/screenshot.png" />
-  </a>
-</div>
+This is a fork of [DeepSeek TUI](https://github.com/DeepSeek-TUI/DeepSeek-TUI) that adds backend infrastructure for running the agent as a long-lived daemon with swarm coordination, persistent sessions, and a SQLite-backed context store. The TUI remains fully compatible with the upstream project.
+
+---
+
+## What's Different from Upstream
+
+### 1. Daemon Mode (`deepseek serve --daemon`)
+
+The original DeepSeek TUI runs as an interactive terminal application. This fork adds a production-grade daemon mode:
+
+- **`deepseek serve --daemon`** — Forks to background, detaches from terminal, and serves an HTTP API
+- **PID file support** — `--pid-file /var/run/deepseek.pid` for process supervision (systemd, launchd)
+- **Auto-shutdown** — `--auto-shutdown-idle` with configurable `--idle-timeout-secs` (default 300s)
+- **`deepseek status`** — Dashboard showing connected clients, active tasks, swarm agents, and uptime
+- **`deepseek version`** — Prints version and exits
+- **`deepseek stdio`** — JSON-RPC over stdin/stdout for IDE/editor integration
+- **Daemon detection** — Running `deepseek serve` when a daemon is already active shows the dashboard instead of starting a duplicate
+- **systemd service file** — Ships with `deepseek.service` for one-command deployment on Linux
+
+### 2. Swarm Orchestration (`deepseek-swarm` crate)
+
+Multi-agent coordination with a shared knowledge store:
+
+- **Hive Mind** — Thread-safe, versioned key-value store shared across all agents. Supports pub/sub notifications, namespace isolation (`agent.*`, `finding.*`, `decision.*`, `task.*`), and full snapshots for new agent initialization
+- **Swarm Orchestrator** — Spawns, assigns tasks to, and coordinates multiple specialized agents concurrently
+- **Agent Roles** — Explorer (read-only), Implementer, Reviewer, Tester, Planner, Coordinator, General — each with appropriate tool restrictions
+- **Task Graph** — DAG-based task decomposition with dependency resolution, parallel scheduling, and progress tracking
+- **Objective Decomposition** — `SwarmOrchestrator::decompose_objective("add dark mode support")` auto-generates a 5-node task graph (explore → design → implement → review → test)
+- **Hive Persistence** — `checkpoint_hive()` / `restore_from_store()` save and restore swarm state across daemon restarts
+
+### 3. Hybrid Context Store (`deepseek-context` crate)
+
+SQLite-backed persistent context with in-memory hot cache:
+
+- **Conversation turns** — Full turn storage with reasoning blocks, model info, tool calls, and tags
+- **Context entries** — Snippets, links, decisions, file references, workspace state, images
+- **Full-text search** — `search_turns("SQLite", 5)` across all stored conversations
+- **Hybrid context builder** — `build_hybrid_context()` assembles a token-budgeted context window from recent turns, decisions, workspace state, and search results
+- **Batch operations** — `insert_turns_batch()` for efficient bulk storage
+- **Tag-based search** — `search_by_tags(["rust", "example"], 10)`
+
+### 4. Session Persistence (`deepseek-session` crate)
+
+Full session lifecycle management:
+
+- **Save/resume** — Sessions persist across daemon restarts with `SessionStore`
+- **Export/import** — `.ds-session` archive format (tar.gz) with manifest + turns, validation on import
+- **Cross-device resume** — Export on one machine, import on another
+- **Session builder** — `SessionBuilder` fluent API for constructing sessions programmatically
+- **Search and filter** — `search("rust")`, `list_by_workspace("/path")`, tag filtering
+- **Archive validation** — `validate_archive()` checks header, manifest, turns, and structure integrity
+
+### 5. Planning System (`deepseek-planning` crate)
+
+Structured development workflow based on the GSD (Getting Stuff Done) methodology:
+
+- **Project manifest** — PROJECT.md with vision, constraints, decisions
+- **Requirements** — REQ-001 style tracking with status (Proposed/Accepted/Implemented/Deferred) and priorities
+- **Roadmap** — Phases with dependencies, status tracking, and plan estimates
+- **Phase pipeline** — State machine that routes: Discuss → Plan → Execute → Verify → Ship
+- **Plan files** — Per-phase PLAN.md with tasks, effort estimates, and agent assignment
+- **Project state** — STATE.md with blockers, decisions, and metrics
+
+### 6. Plugin System (`deepseek-plugins` crate)
+
+Composable skill and plugin management:
+
+- **Skill loader** — Parses SKILL.md files with YAML frontmatter (name, description, category, allowed_tools)
+- **Plugin registry** — Discovers plugins from disk, manages enable/disable state
+- **Skill search** — `search_skills("phase")` finds relevant skills by name/description
+- **Install/uninstall** — Plugin manifests with versioning, dependencies, and skill lists
+- **Categories** — Workflow, Quality, Context, Manage, Ideate, Custom
+
+### 7. Enhanced TUI Core (`deepseek-tui-core` crate)
+
+Extended the original event system with production features:
+
+- **Context budget tracking** — `ContextBudget` with warning/critical thresholds, ASCII gauge bar rendering (`[████▓▓░░░░] 65%`)
+- **Bracketed paste support** — `BracketedPasteBuffer` handles terminal paste sequences (`\e[200~` … `\e[201~`) with multi-line paste detection
+- **Paste content detection** — Auto-detects text, code (with language), URLs, images, or mixed content
+- **Extended UI events** — 20+ new event types: `PasteStart`, `PasteEnd`, `PasteContent`, `ContextWarning`, `ContextCritical`, `TabPressed`, `SlashCommand`, `AgentSpawned`, `AgentCompleted`, `AgentErrored`, `AgentHeartbeat`, `CaptureCheckpoint`, `RestoreCheckpoint`, etc.
+- **Slash command system** — `/help`, `/model`, `/compact`, `/restore`, `/checkpoint`, `/agents`, `/hive`, `/sessions`, `/progress`, `/resume` with completion and popup UI
+- **Path autocompletion** — Tab-triggered file/directory completion in the composer
+- **Checkpoint system** — Named snapshots of session state for save/restore
+- **Stack-allocated effects** — `EffectVec` uses `SmallVec<[UiEffect; 4]>` to avoid heap allocation for common effect chains
+
+### 8. Enhanced Tools (`deepseek-tools` crate)
+
+- **Tool execution metrics** — Per-tool success/failure/timeout/retry tracking with average duration and success rate
+- **Retry policy** — Configurable `RetryPolicy` with max retries, exponential backoff, and timeout handling
+- **Parallel execution** — `ToolCallRuntime::with_max_parallel(n)` with semaphore-based concurrency control
+- **Metrics snapshots** — `metrics_snapshot()` returns aggregated stats across all tools
+
+### 9. Enhanced Agent Registry (`deepseek-agent` crate)
+
+- **Model lifecycle** — `add_model()`, `remove_model()`, `deprecate_model()`, `undeprecate_model()`
+- **Stable IDs** — Each model gets a persistent stable identifier for reliable references
+- **Provider filtering** — `filter_by_provider(ProviderKind::DeepSeek)`
+- **Capability filtering** — `filter_by_capabilities(Capabilities { reasoning: true, .. })`
+- **Active models** — `active_models()` returns non-deprecated entries only
+
+### 10. App Server Upgrades (`deepseek-app-server`)
+
+- **Daemon state** — Tracks connected clients, detached mode, active task count, and uptime
+- **Daemon API endpoints** — `/healthz`, `/daemon/status`, `/daemon/resume`, `/daemon/progress`
+- **Swarm endpoints** — `/swarm/agents`, `/hive/summary`
+- **Terminal input module** — Raw mode management with bracketed paste, `TerminalInput` wrapping stdin
+- **Daemon supervisor** — Progress logging, agent lifecycle tracking, resume suggestions, hive checkpoint/restore
+- **Session integration** — Session store wired into the HTTP API for list/resume/export
+
+---
+
+## Architecture
+
+```
+deepseek (CLI dispatcher)
+  ├─ deepseek serve --daemon   → app-server (HTTP API)
+  │   ├─ supervisor            → progress logging, resume suggestions
+  │   ├─ terminal              → raw mode, bracketed paste
+  │   ├─ swarm orchestrator    → multi-agent coordination
+  │   │   ├─ hive mind         → shared knowledge store
+  │   │   └─ task graph        → DAG-based decomposition
+  │   ├─ context store         → SQLite + in-memory cache
+  │   ├─ session store         → persistent session lifecycle
+  │   └─ plugin registry       → skill discovery and loading
+  ├─ deepseek stdio            → JSON-RPC for IDE integration
+  ├─ deepseek status           → dashboard
+  └─ deepseek version          → version info
+```
+
+---
+
+## New Crate Map
+
+| Crate | Purpose | LOC |
+|---|---|---|
+| `deepseek` | CLI dispatcher with daemon, status, version, stdio commands | 209 |
+| `deepseek-app-server` | HTTP API with daemon mode, supervisor, terminal input | 1,118 |
+| `deepseek-context` | SQLite-backed hybrid context store | 1,469 |
+| `deepseek-planning` | GSD planning system (phases, plans, requirements) | 587 |
+| `deepseek-plugins` | Plugin registry and skill loader | 533 |
+| `deepseek-session` | Persistent sessions with export/import | 890 |
+| `deepseek-swarm` | Swarm orchestration with hive mind and task graph | 1,521 |
+| `deepseek-tui-core` | Extended TUI events, context budget, bracketed paste | 2,884 |
+| `deepseek-tools` | Tool metrics, retry policy, parallel execution | 870 |
+| `deepseek-agent` | Model registry with lifecycle management | 865 |
+
+---
 
 ## Install
 
-### Windows
-
-1.  Go to the [Releases](../../releases) section.
-2.  Download the `DeepSeek-TUI_x64.7z` file.
-3.  Run the installer and follow the on-screen instructions.
-
-### macOS
-
-1.  Go to the [Releases](../../releases) section.
-2.  Select the disk image for your architecture:
-      - `DeepSeek-TUI_macOS.dmg` (Apple Silicon).
-3.  Open the `.dmg` file and drag the application icon into the `Applications` folder.
-4.  *Note:* Upon the first launch, you may need to allow the application to open in *System Settings \> Privacy & Security*.
-
----
-
-## What Is It?
-
-DeepSeek TUI is a coding agent that runs in your terminal. It can read and edit files, run shell commands, search the web, manage git, and coordinate sub-agents from a keyboard-driven TUI.
-
-It is built around DeepSeek V4 (`deepseek-v4-pro` / `deepseek-v4-flash`), including 1M-token context windows, streaming reasoning blocks, and prefix-cache-aware cost reporting.
-
-### Key Features
-
-- **Auto mode** — `--model auto` / `/model auto` chooses both the model and thinking level for each turn
-- **Thinking-mode streaming** — see DeepSeek reasoning blocks as the model works
-- **Full tool suite** — file ops, shell execution, git, web search/browse, apply-patch, sub-agents, MCP servers
-- **1M-token context** — context tracking, manual or configured compaction, and prefix-cache telemetry
-- **Three modes** — Plan (read-only explore), Agent (interactive with approval), YOLO (auto-approved)
-- **Reasoning-effort tiers** — cycle through `off → high → max` with `Shift + Tab`
-- **Session save/resume** — checkpoint and resume long-running sessions
-- **Workspace rollback** — side-git pre/post-turn snapshots with `/restore` and `revert_turn`, without touching your repo's `.git`
-- **Durable task queue** — background tasks can survive restarts
-- **HTTP/SSE runtime API** — `deepseek serve --http` for headless agent workflows
-- **MCP protocol** — connect to Model Context Protocol servers for extended tooling; please see [docs/MCP.md](docs/MCP.md)
-- **Native RLM** (`rlm_query`) — run batched analysis through cheap `deepseek-v4-flash` children using the same API client
-- **LSP diagnostics** — inline error/warning surfacing after every edit via rust-analyzer, pyright, typescript-language-server, gopls, clangd
-- **User memory** — optional persistent note file injected into the system prompt for cross-session preferences
-- **Localized UI** — `en`, `ja`, `zh-Hans`, `pt-BR` with auto-detection
-- **Live cost tracking** — per-turn and session-level token usage and cost estimates; cache hit/miss breakdown
-- **Skills system** — composable, installable instruction packs from GitHub with no backend service required
-
----
-
-## How It's Wired
-
-`deepseek` (dispatcher CLI) → `deepseek-tui` (companion binary) → ratatui interface ↔ async engine ↔ OpenAI-compatible streaming client. Tool calls route through a typed registry (shell, file ops, git, web, sub-agents, MCP, RLM) and results stream back into the transcript. The engine manages session state, turn tracking, the durable task queue, and an LSP subsystem that feeds post-edit diagnostics into the model's context before the next reasoning step.
-
----
-
-## Quickstart
-
-Prebuilt binaries are published for **macOS ARM64**, and **Windows x64** in [Releases](../../releases) section.
-
-On first launch you'll be prompted for your [DeepSeek API key](https://platform.deepseek.com/api_keys). The key is saved to `~/.deepseek/config.toml` so it works from any directory without OS credential prompts.
-
-
-### Auto Mode
-
-Use `deepseek --model auto` or `/model auto` when you want DeepSeek TUI to decide how much model and reasoning power a turn needs.
-
-Auto mode controls two settings together:
-
-- Model: `deepseek-v4-flash` or `deepseek-v4-pro`
-- Thinking: `off`, `high`, or `max`
-
-Before the real turn is sent, the app makes a small `deepseek-v4-flash` routing call with thinking off. That router looks at the latest request and recent context, then selects a concrete model and thinking level for the real request. Short/simple turns can stay on Flash with thinking off; coding, debugging, release work, architecture, security review, or ambiguous multi-step tasks can move up to Pro and/or higher thinking.
-
-`auto` is local to DeepSeek TUI. The upstream API never receives `model: "auto"`; it receives the concrete model and thinking setting chosen for that turn. The TUI shows the selected route, and cost tracking is charged against the model that actually ran. If the router call fails or returns an invalid answer, the app falls back to a local heuristic. Sub-agents inherit auto mode unless you assign them an explicit model.
-
-Use a fixed model or fixed thinking level when you want repeatable benchmarking, a strict cost ceiling, or a specific provider/model mapping.
-
----
-
-## What's New In v0.8.14
-
-A stabilization release focused on first-run setup, auto model + thinking routing, cost accounting, and provider support.
-
-- **Auto mode restored** — `--model auto`, `/model auto`, config `default_model = "auto"`, one-shot prompts, and sub-agents resolve to concrete model + thinking routes before calling the API
-- **Per-turn cost accounting fix** — V4 reasoning tokens are counted as billable output when providers report them separately from completion tokens
-- **First-run setup repair** — missing config files now lead users through API key setup and create `~/.deepseek/config.toml`
-- **Settings navigation fix** — arrow-key selection and click highlighting in the config UI work reliably on Windows terminals
-- **vLLM provider support** — self-hosted vLLM endpoints can be used with `--provider vllm` and `VLLM_BASE_URL`
-
----
-
-## Usage
+### From Source
 
 ```bash
-deepseek                                         # interactive TUI
-deepseek "explain this function"                 # one-shot prompt
-deepseek --model deepseek-v4-flash "summarize"   # model override
-deepseek --model auto "fix this bug"             # auto-select model + thinking
-deepseek --yolo                                  # auto-approve tools
-deepseek auth set --provider deepseek            # save API key
-deepseek doctor                                  # check setup & connectivity
-deepseek doctor --json                           # machine-readable diagnostics
-deepseek setup --status                          # read-only setup status
-deepseek setup --tools --plugins                 # scaffold tool/plugin dirs
-deepseek models                                  # list live API models
-deepseek sessions                                # list saved sessions
-deepseek resume --last                           # resume the most recent session in this workspace
-deepseek resume <SESSION_ID>                     # resume a specific session by UUID
-deepseek fork <SESSION_ID>                       # fork a session at a chosen turn
-deepseek serve --http                            # HTTP/SSE API server
-deepseek serve --acp                             # ACP stdio adapter for Zed/custom agents
-deepseek pr <N>                                  # fetch PR and pre-seed review prompt
-deepseek mcp list                                # list configured MCP servers
-deepseek mcp validate                            # validate MCP config/connectivity
-deepseek mcp-server                              # run dispatcher MCP stdio server
+git clone https://github.com/Daigtas/DeepSeek-TUI-fork.git
+cd DeepSeek-TUI-fork
+cargo build --release
 ```
 
-### Zed / ACP
+The binary is at `target/release/deepseek`.
 
-DeepSeek can run as a custom Agent Client Protocol server for editors that
-spawn local ACP agents over stdio. In Zed, add a custom agent server:
+### Daemon Setup (systemd)
 
-```json
-{
-  "agent_servers": {
-    "DeepSeek": {
-      "type": "custom",
-      "command": "deepseek",
-      "args": ["serve", "--acp"],
-      "env": {}
-    }
-  }
-}
+```bash
+sudo cp deepseek.service /etc/systemd/system/
+sudo systemctl daemon-reload
+sudo systemctl enable --now deepseek
 ```
 
-The first ACP slice supports new sessions and prompt responses through your
-existing DeepSeek config/API key. Tool-backed editing and checkpoint replay are
-not exposed through ACP yet.
+### API Endpoints
 
-### Keyboard Shortcuts
-
-| Key | Action |
+| Endpoint | Description |
 |---|---|
-| `Tab` | Complete `/` or `@` entries; while running, queue draft as follow-up; otherwise cycle mode |
-| `Shift+Tab` | Cycle reasoning-effort: off → high → max |
-| `F1` | Searchable help overlay |
-| `Esc` | Back / dismiss |
-| `Ctrl+K` | Command palette |
-| `Ctrl+R` | Resume an earlier session |
-| `Alt+R` | Search prompt history and recover cleared drafts |
-| `Ctrl+S` | Stash current draft (`/stash list`, `/stash pop` to recover) |
-| `@path` | Attach file/directory context in composer |
-| `↑` (at composer start) | Select attachment row for removal |
+| `GET /healthz` | Health check |
+| `GET /daemon/status` | Connected clients, active tasks, uptime |
+| `GET /daemon/resume` | Resume suggestion with active agents and progress |
+| `GET /daemon/progress` | Recent progress log entries |
+| `GET /swarm/agents` | Active agent list |
+| `GET /hive/summary` | Hive mind summary |
 
 ---
 
-## Modes
+## Upstream Compatibility
 
-| Mode | Behavior |
-| --- | --- |
-| **Plan** 🔍 | Read-only investigation — model explores and proposes a plan (`update_plan` + `checklist_write`) before making changes |
-| **Agent** 🤖 | Default interactive mode — multi-step tool use with approval gates; model outlines work via `checklist_write` |
-| **YOLO** ⚡ | Auto-approve all tools in a trusted workspace; still maintains plan and checklist for visibility |
-
----
-
-## Configuration
-
-User config: `~/.deepseek/config.toml`. Project overlay: `<workspace>/.deepseek/config.toml` (denied: `api_key`, `base_url`, `provider`, `mcp_config_path`).
-
-Key environment variables:
-
-| Variable | Purpose |
-|---|---|
-| `DEEPSEEK_API_KEY` | API key |
-| `DEEPSEEK_BASE_URL` | API base URL |
-| `DEEPSEEK_MODEL` | Default model |
-| `DEEPSEEK_PROVIDER` | `deepseek` (default), `nvidia-nim`, `fireworks`, `sglang`, `vllm` |
-| `DEEPSEEK_PROFILE` | Config profile name |
-| `DEEPSEEK_MEMORY` | Set to `on` to enable user memory |
-| `NVIDIA_API_KEY` / `FIREWORKS_API_KEY` / `SGLANG_API_KEY` / `VLLM_API_KEY` | Provider auth |
-| `SGLANG_BASE_URL` | Self-hosted SGLang endpoint |
-| `VLLM_BASE_URL` | Self-hosted vLLM endpoint |
-| `NO_ANIMATIONS=1` | Force accessibility mode at startup |
-| `SSL_CERT_FILE` | Custom CA bundle for corporate proxies |
-
----
-
-## Models & Pricing
-
-| Model | Context | Input (cache hit) | Input (cache miss) | Output |
-|---|---|---|---|---|
-| `deepseek-v4-pro` | 1M | $0.003625 / 1M* | $0.435 / 1M* | $0.87 / 1M* |
-| `deepseek-v4-flash` | 1M | $0.0028 / 1M | $0.14 / 1M | $0.28 / 1M |
-
-Legacy aliases `deepseek-chat` / `deepseek-reasoner` map to `deepseek-v4-flash`. NVIDIA NIM variants use your NVIDIA account terms.
-
-*DeepSeek Pro rates currently reflect a limited-time 75% discount, which remains valid until 15:59 UTC on 31 May 2026. After that time, the TUI cost estimator will revert to the base Pro rates.*
-
-> [!Note]
-> For the latest DeepSeek-V4-Pro pricing, including the current 75% discount valid until 15:59 UTC on 31 May 2026, please consult the official [DeepSeek pricing page](https://api-docs.deepseek.com/zh-cn/quick_start/pricing). All rates listed in the README correspond to the officially published values.
-
----
-
-## Publishing Your Own Skill
-
-DeepSeek TUI discovers skills from workspace directories (`.agents/skills` → `skills` → `.opencode/skills` → `.claude/skills` → `.cursor/skills`) and global directories (`~/.agents/skills` → `~/.deepseek/skills`). Each skill is a directory with a `SKILL.md` file:
-
-```text
-~/.agents/skills/my-skill/
-└── SKILL.md
-```
-
-Frontmatter required:
-
-```markdown
----
-name: my-skill
-description: Use this when DeepSeek should follow my custom workflow.
----
-
-# My Skill
-Instructions for the agent go here.
-```
-
-Commands: `/skills` (list), `/skill <name>` (activate), `/skill new` (scaffold), `/skill install github:<owner>/<repo>` (community), `/skill update` / `uninstall` / `trust`. Community installs from GitHub require no backend service. Installed skills appear in the model-visible session context; the agent can auto-select relevant skills via the `load_skill` tool when your task matches their descriptions.
-
----
+This fork is fully compatible with the upstream DeepSeek TUI. It adds backend infrastructure without removing or breaking any existing functionality. The TUI frontend, model integration, tool suite, and configuration system remain identical to upstream.
 
 ---
 
 ## License
 
-[LICENSE](LICENSE)
+[MIT](LICENSE) — same as upstream.
