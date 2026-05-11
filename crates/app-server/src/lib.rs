@@ -1,42 +1,118 @@
+use std::collections::HashSet;
+use std::fs;
+use std::io::Write;
 use std::net::SocketAddr;
 use std::path::PathBuf;
+use std::process;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
-use anyhow::Result;
+use anyhow::{Context, Result, bail};
 use axum::extract::State;
-use axum::routing::{get, post};
+use axum::routing::{delete, get, post};
 use axum::{Json, Router};
+use chrono::Utc;
 use deepseek_agent::ModelRegistry;
 use deepseek_config::{CliRuntimeOverrides, ConfigStore};
+use deepseek_context::HybridContextStore;
 use deepseek_core::Runtime;
-use deepseek_execpolicy::ExecPolicyEngine;
+use deepseek_execpolicy::{AskForApproval, ExecPolicyEngine};
 use deepseek_hooks::{HookDispatcher, JsonlHookSink, StdoutHookSink};
 use deepseek_mcp::McpManager;
 use deepseek_protocol::{
-    AppRequest, AppResponse, PromptRequest, PromptResponse, ThreadRequest, ThreadResponse,
+    AppRequest, AppResponse, PromptRequest, PromptResponse, ThreadListParams, ThreadRequest,
+    ThreadResponse,
 };
+use deepseek_session::SessionStore;
 use deepseek_state::StateStore;
+use deepseek_swarm::{AgentRole, AgentSpec, SwarmOrchestrator};
 use deepseek_tools::{ToolCall, ToolRegistry};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-use tokio::sync::{Mutex, RwLock};
+use tokio::sync::{RwLock, mpsc};
 use tower_http::cors::CorsLayer;
+use tracing::{info, warn};
+use uuid::Uuid;
+
+mod terminal;
+mod supervisor;
+
+use supervisor::DaemonSupervisor;
+
+// ── Options ────────────────────────────────────────────────────────────────
 
 #[derive(Debug, Clone)]
 pub struct AppServerOptions {
     pub listen: SocketAddr,
     pub config_path: Option<PathBuf>,
+    pub daemon: bool,
+    pub pid_file: Option<PathBuf>,
+    pub auto_shutdown_idle: bool,
+    pub idle_timeout_secs: u64,
 }
+
+// ── Daemon state ───────────────────────────────────────────────────────────
+
+struct DaemonState {
+    connected_clients: RwLock<HashSet<String>>,
+    detached: AtomicBool,
+    active_tasks: AtomicU64,
+    started_at: String,
+    auto_shutdown_idle: AtomicBool,
+    #[allow(dead_code)] idle_timeout_secs: u64,
+}
+
+impl DaemonState {
+    fn new(auto_shutdown_idle: bool, idle_timeout_secs: u64) -> Self {
+        Self {
+            connected_clients: RwLock::new(HashSet::new()),
+            detached: AtomicBool::new(false),
+            active_tasks: AtomicU64::new(0),
+            started_at: Utc::now().to_rfc3339(),
+            auto_shutdown_idle: AtomicBool::new(auto_shutdown_idle),
+            idle_timeout_secs,
+        }
+    }
+    async fn client_connect(&self) -> String {
+        let id = Uuid::new_v4().to_string();
+        self.connected_clients.write().await.insert(id.clone());
+        id
+    }
+    #[allow(dead_code)]
+    async fn client_disconnect(&self, id: &str) {
+        self.connected_clients.write().await.remove(id);
+    }
+    #[allow(dead_code)]
+    async fn connected_count(&self) -> usize {
+        self.connected_clients.read().await.len()
+    }
+    fn task_started(&self) { self.active_tasks.fetch_add(1, Ordering::SeqCst); }
+    #[allow(dead_code)]
+    fn task_finished(&self) { self.active_tasks.fetch_sub(1, Ordering::SeqCst); }
+    fn active_task_count(&self) -> u64 { self.active_tasks.load(Ordering::SeqCst) }
+    fn should_auto_shutdown(&self) -> bool { self.auto_shutdown_idle.load(Ordering::SeqCst) }
+    fn set_detached(&self, v: bool) { self.detached.store(v, Ordering::SeqCst); }
+    fn is_detached(&self) -> bool { self.detached.load(Ordering::SeqCst) }
+}
+
+// ── App state ──────────────────────────────────────────────────────────────
 
 #[derive(Clone)]
 struct AppState {
     config_path: Option<PathBuf>,
     config: Arc<RwLock<deepseek_config::ConfigToml>>,
-    runtime: Arc<Mutex<Runtime>>,
+    runtime: Arc<tokio::sync::Mutex<Runtime>>,
     registry: ModelRegistry,
+    session_store: Arc<SessionStore>,
+    daemon: Arc<DaemonState>,
+    swarm: Arc<SwarmOrchestrator>,
+    context_store: Arc<HybridContextStore>,
+    supervisor: Arc<DaemonSupervisor>,
 }
+
+// ── Request types ──────────────────────────────────────────────────────────
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct ToolCallRequest {
@@ -44,56 +120,45 @@ struct ToolCallRequest {
     #[serde(default)]
     cwd: Option<PathBuf>,
 }
-
 #[derive(Debug, Deserialize)]
 struct JsonRpcRequest {
-    #[serde(default)]
-    jsonrpc: Option<String>,
-    #[serde(default)]
-    id: Option<Value>,
+    #[serde(default)] jsonrpc: Option<String>,
+    #[serde(default)] id: Option<Value>,
     method: String,
-    #[serde(default)]
-    params: Value,
+    #[serde(default)] params: Value,
 }
-
 #[derive(Debug)]
-struct JsonRpcError {
-    code: i64,
-    message: String,
-    data: Option<Value>,
-}
-
+struct JsonRpcError { code: i64, message: String, data: Option<Value> }
 #[derive(Debug)]
-struct StdioDispatchResult {
-    result: Value,
-    should_exit: bool,
-}
-
+struct StdioDispatchResult { result: Value, should_exit: bool }
+#[derive(Debug, Deserialize)] #[allow(dead_code)]
+struct ConfigGetParams { key: String }
+#[derive(Debug, Deserialize)] #[allow(dead_code)]
+struct ConfigSetParams { key: String, value: String }
+#[derive(Debug, Deserialize)] #[allow(dead_code)]
+struct ThreadIdParams { thread_id: String }
+#[derive(Debug, Deserialize)] #[allow(dead_code)]
+struct ThreadMessageParams { thread_id: String, input: String }
+#[derive(Debug, Deserialize)] #[allow(dead_code)]
+struct SessionExportParams { session_id: String, #[serde(default)] output_path: Option<String> }
 #[derive(Debug, Deserialize)]
-struct ConfigGetParams {
-    key: String,
-}
+struct SessionImportParams { archive_path: String, #[serde(default)] overwrite: bool }
+#[derive(Debug, Deserialize)] #[allow(dead_code)]
+struct SessionSearchParams { query: String }
 
-#[derive(Debug, Deserialize)]
-struct ConfigSetParams {
-    key: String,
-    value: String,
-}
-
-#[derive(Debug, Deserialize)]
-struct ThreadIdParams {
-    thread_id: String,
-}
-
-#[derive(Debug, Deserialize)]
-struct ThreadMessageParams {
-    thread_id: String,
-    input: String,
-}
+// ── Entry points ───────────────────────────────────────────────────────────
 
 pub async fn run(options: AppServerOptions) -> Result<()> {
-    let state = build_state(options.config_path.clone())?;
+    run_foreground(options).await
+}
 
+async fn run_foreground(options: AppServerOptions) -> Result<()> {
+    info!(listen=%options.listen, daemon=options.daemon, "starting");
+
+    let state = build_state(&options)?;
+
+    // Log startup (hive mind restores lazily on first /daemon/resume call)
+    state.supervisor.log("startup", "Daemon started — hive mind will restore on first resume", None).await;
     let app = Router::new()
         .route("/healthz", get(healthz))
         .route("/thread", post(thread_handler))
@@ -102,682 +167,418 @@ pub async fn run(options: AppServerOptions) -> Result<()> {
         .route("/tool", post(tool_handler))
         .route("/jobs", get(jobs_handler))
         .route("/mcp/startup", post(mcp_startup_handler))
+        .route("/sessions", get(session_list_handler))
+        .route("/sessions/{id}", get(session_read_handler))
+        .route("/sessions/{id}", delete(session_delete_handler))
+        .route("/sessions/{id}/export", post(session_export_handler))
+        .route("/sessions/import", post(session_import_handler))
+        .route("/daemon/detach", post(daemon_detach_handler))
+        .route("/daemon/attach", post(daemon_attach_handler))
+        .route("/daemon/status", get(daemon_status_handler))
+        .route("/swarm/agents", get(swarm_agents_handler))
+        .route("/swarm/spawn", post(swarm_spawn_handler))
+        .route("/hive/query/{key}", get(hive_query_handler))
+        .route("/hive/inject", post(hive_inject_handler))
+        .route("/hive/summary", get(hive_summary_handler))
+        .route("/hive/snapshot", get(hive_snapshot_handler))
+        .route("/daemon/resume", get(daemon_resume_handler))
+        .route("/daemon/progress", get(daemon_progress_handler))
+        .route("/daemon/checkpoint", post(daemon_checkpoint_handler))
         .layer(CorsLayer::permissive())
-        .with_state(state);
+        .with_state(state.clone());
 
     let listener = tokio::net::TcpListener::bind(options.listen).await?;
-    axum::serve(listener, app).await?;
+    info!("listening on {}", options.listen);
+
+    let shutdown_tx = if options.auto_shutdown_idle {
+        let s = state.clone(); let t = options.idle_timeout_secs;
+        let (tx, rx) = mpsc::channel::<()>(1);
+        tokio::spawn(async move { auto_shutdown_watcher(s, t, rx).await; });
+        Some(tx)
+    } else { None };
+
+    axum::serve(listener, app)
+        .with_graceful_shutdown(daemon_shutdown(state.clone()))
+        .await?;
+
+    if let Some(tx) = shutdown_tx { let _ = tx.send(()).await; }
+    if let Some(ref pf) = options.pid_file { let _ = fs::remove_file(pf); }
+    info!("shut down cleanly");
     Ok(())
 }
 
-pub async fn run_stdio(config_path: Option<PathBuf>) -> Result<()> {
-    let state = build_state(config_path)?;
-    let stdin = tokio::io::stdin();
-    let stdout = tokio::io::stdout();
-    let mut reader = BufReader::new(stdin).lines();
-    let mut writer = tokio::io::BufWriter::new(stdout);
-    while let Some(line) = reader.next_line().await? {
-        if line.trim().is_empty() {
-            continue;
-        }
+// ── Shutdown / lifecycle ───────────────────────────────────────────────────
 
-        let request: JsonRpcRequest = match serde_json::from_str(&line) {
-            Ok(value) => value,
-            Err(err) => {
-                let response = jsonrpc_error(
-                    None,
-                    JsonRpcError::parse_error(format!("invalid json: {err}")),
-                );
-                writer.write_all(response.to_string().as_bytes()).await?;
-                writer.write_all(b"\n").await?;
-                writer.flush().await?;
-                continue;
+async fn daemon_shutdown(state: AppState) {
+    let ctrl_c = async { tokio::signal::ctrl_c().await.expect("ctrl-c"); };
+    #[cfg(unix)] let terminate = async {
+        tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+            .expect("sigterm").recv().await;
+    };
+    #[cfg(unix)] let hangup = {
+        let mut sig = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::hangup())
+            .expect("sighup");
+        async move { loop { sig.recv().await; state.daemon.set_detached(true); } }
+    };
+    #[cfg(not(unix))] let terminate = std::future::pending::<()>();
+    #[cfg(not(unix))] let hangup = std::future::pending::<()>();
+    tokio::select! { _ = ctrl_c => { info!("Ctrl+C"); } _ = terminate => { info!("SIGTERM"); } _ = hangup => {} }
+}
+
+async fn auto_shutdown_watcher(state: AppState, timeout_secs: u64, mut cancel: mpsc::Receiver<()>) {
+    let dur = tokio::time::Duration::from_secs(timeout_secs);
+    loop {
+        tokio::select! { _ = cancel.recv() => { return; } _ = tokio::time::sleep(tokio::time::Duration::from_secs(5)) => {} }
+        if state.daemon.connected_count().await == 0 && state.daemon.active_task_count() == 0 {
+            tokio::select! { _ = cancel.recv() => { return; } _ = tokio::time::sleep(dur) => {} }
+            if state.daemon.connected_count().await == 0 && state.daemon.active_task_count() == 0 {
+                info!("auto-shutdown: idle, all tasks complete");
+                process::exit(0);
             }
-        };
-
-        if request
-            .jsonrpc
-            .as_deref()
-            .is_some_and(|version| version != "2.0")
-        {
-            let response = jsonrpc_error(
-                request.id,
-                JsonRpcError::invalid_request("jsonrpc version must be 2.0"),
-            );
-            writer.write_all(response.to_string().as_bytes()).await?;
-            writer.write_all(b"\n").await?;
-            writer.flush().await?;
-            continue;
         }
-
-        let response = match dispatch_stdio_request(&state, &request.method, request.params).await {
-            Ok(dispatch) => {
-                let encoded = jsonrpc_result(request.id, dispatch.result);
-                writer.write_all(encoded.to_string().as_bytes()).await?;
-                writer.write_all(b"\n").await?;
-                writer.flush().await?;
-                if dispatch.should_exit {
-                    break;
-                }
-                continue;
-            }
-            Err(err) => jsonrpc_error(request.id, err),
-        };
-
-        writer.write_all(response.to_string().as_bytes()).await?;
-        writer.write_all(b"\n").await?;
-        writer.flush().await?;
     }
-
-    Ok(())
 }
+
+// ── HTTP handlers ──────────────────────────────────────────────────────────
 
 async fn healthz() -> Json<Value> {
-    Json(json!({
-        "status": "ok",
-        "protocol": "v2",
-        "service": "deepseek-app-server"
-    }))
+    Json(json!({"status":"ok","protocol":"v2","service":"deepseek-app-server","version":env!("CARGO_PKG_VERSION")}))
 }
 
-async fn thread_handler(
-    State(state): State<AppState>,
-    Json(req): Json<ThreadRequest>,
-) -> Json<ThreadResponse> {
-    let mut runtime = state.runtime.lock().await;
-    match runtime.handle_thread(req).await {
-        Ok(res) => Json(res),
-        Err(err) => Json(ThreadResponse {
-            thread_id: "error".to_string(),
-            status: format!("error:{err}"),
-            thread: None,
-            threads: Vec::new(),
-            model: None,
-            model_provider: None,
-            cwd: None,
-            approval_policy: None,
-            sandbox: None,
-            events: Vec::new(),
-            data: json!({}),
-        }),
+async fn thread_handler(State(state): State<AppState>, Json(req): Json<ThreadRequest>) -> Json<ThreadResponse> {
+    let mut rt = state.runtime.lock().await;
+    match rt.handle_thread(req).await {
+        Ok(r) => Json(r),
+        Err(e) => Json(ThreadResponse { thread_id:"error".into(),status:format!("error:{e}"),thread:None,threads:vec![],model:None,model_provider:None,cwd:None,approval_policy:None,sandbox:None,events:vec![],data:json!({})}),
     }
 }
 
-async fn prompt_handler(
-    State(state): State<AppState>,
-    Json(req): Json<PromptRequest>,
-) -> Json<PromptResponse> {
-    let mut runtime = state.runtime.lock().await;
-    let overrides = CliRuntimeOverrides::default();
-    match runtime.handle_prompt(req, &overrides).await {
-        Ok(res) => Json(res),
-        Err(err) => Json(PromptResponse {
-            output: err.to_string(),
-            model: "unknown".to_string(),
-            events: Vec::new(),
-        }),
+async fn prompt_handler(State(state): State<AppState>, Json(req): Json<PromptRequest>) -> Json<PromptResponse> {
+    let mut rt = state.runtime.lock().await;
+    match rt.handle_prompt(req, &CliRuntimeOverrides::default()).await {
+        Ok(r) => Json(r),
+        Err(e) => Json(PromptResponse { output:e.to_string(), model:"unknown".into(), events:vec![] }),
     }
 }
 
-async fn tool_handler(
-    State(state): State<AppState>,
-    Json(req): Json<ToolCallRequest>,
-) -> Json<Value> {
-    let runtime = state.runtime.lock().await;
-    let cwd = req
-        .cwd
-        .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")));
-    match runtime
-        .invoke_tool(
-            req.call,
-            deepseek_execpolicy::AskForApproval::OnRequest,
-            &cwd,
-        )
-        .await
-    {
-        Ok(value) => Json(value),
-        Err(err) => Json(json!({ "ok": false, "error": err.to_string() })),
+async fn tool_handler(State(state): State<AppState>, Json(req): Json<ToolCallRequest>) -> Json<Value> {
+    let rt = state.runtime.lock().await;
+    let cwd = req.cwd.unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")));
+    match rt.invoke_tool(req.call, AskForApproval::OnRequest, &cwd).await {
+        Ok(v) => Json(v),
+        Err(e) => Json(json!({"ok":false,"error":e.to_string()})),
     }
 }
 
 async fn jobs_handler(State(state): State<AppState>) -> Json<AppResponse> {
-    let runtime = state.runtime.lock().await;
-    Json(runtime.app_status())
+    let rt = state.runtime.lock().await;
+    Json(rt.app_status())
 }
 
 async fn mcp_startup_handler(State(state): State<AppState>) -> Json<Value> {
-    let runtime = state.runtime.lock().await;
-    let summary = runtime.mcp_startup().await;
-    Json(json!({
-        "ok": true,
-        "summary": summary
-    }))
+    let rt = state.runtime.lock().await;
+    let s = rt.mcp_startup().await;
+    Json(json!({"ok":true,"summary":s}))
 }
 
-async fn app_handler(
-    State(state): State<AppState>,
-    Json(req): Json<AppRequest>,
-) -> Json<AppResponse> {
+async fn app_handler(State(state): State<AppState>, Json(req): Json<AppRequest>) -> Json<AppResponse> {
     Json(process_app_request(&state, req).await)
 }
 
-fn build_state(config_path: Option<PathBuf>) -> Result<AppState> {
-    let store = ConfigStore::load(config_path.clone())?;
-    let config = store.config.clone();
-    let registry = ModelRegistry::default();
+// ── Session handlers ───────────────────────────────────────────────────────
 
-    let state_db_path = config_path
-        .as_ref()
-        .and_then(|p| p.parent().map(|parent| parent.join("state.db")));
-    let state_store = StateStore::open(state_db_path)?;
-
-    let mut hooks = HookDispatcher::default();
-    hooks.add_sink(Arc::new(StdoutHookSink));
-    let hook_log_path = config_path
-        .as_ref()
-        .and_then(|p| p.parent().map(|parent| parent.join("events.jsonl")))
-        .unwrap_or_else(|| PathBuf::from(".deepseek/events.jsonl"));
-    hooks.add_sink(Arc::new(JsonlHookSink::new(hook_log_path)));
-
-    let runtime = Runtime::new(
-        config.clone(),
-        registry.clone(),
-        state_store,
-        Arc::new(ToolRegistry::default()),
-        Arc::new(McpManager::default()),
-        ExecPolicyEngine::new(Vec::new(), Vec::new()),
-        hooks,
-    );
-
-    Ok(AppState {
-        config_path,
-        config: Arc::new(RwLock::new(config)),
-        runtime: Arc::new(Mutex::new(runtime)),
-        registry,
-    })
-}
-
-fn params_or_object(params: Value) -> Value {
-    if params.is_null() { json!({}) } else { params }
-}
-
-fn parse_params<T: DeserializeOwned>(params: Value) -> std::result::Result<T, JsonRpcError> {
-    serde_json::from_value(params).map_err(|err| JsonRpcError::invalid_params(err.to_string()))
-}
-
-fn jsonrpc_result(id: Option<Value>, result: Value) -> Value {
-    json!({
-        "jsonrpc": "2.0",
-        "id": id.unwrap_or(Value::Null),
-        "result": result
-    })
-}
-
-fn jsonrpc_error(id: Option<Value>, err: JsonRpcError) -> Value {
-    json!({
-        "jsonrpc": "2.0",
-        "id": id.unwrap_or(Value::Null),
-        "error": {
-            "code": err.code,
-            "message": err.message,
-            "data": err.data
-        }
-    })
-}
-
-impl JsonRpcError {
-    fn parse_error(message: impl Into<String>) -> Self {
-        Self {
-            code: -32700,
-            message: message.into(),
-            data: None,
-        }
+async fn session_list_handler(State(state): State<AppState>) -> Json<Value> {
+    match state.session_store.list() {
+        Ok(s) => Json(json!({"ok":true,"sessions":s})),
+        Err(e) => Json(json!({"ok":false,"error":e.to_string()})),
     }
-
-    fn invalid_request(message: impl Into<String>) -> Self {
-        Self {
-            code: -32600,
-            message: message.into(),
-            data: None,
-        }
+}
+async fn session_read_handler(State(state): State<AppState>, axum::extract::Path(id): axum::extract::Path<String>) -> Json<Value> {
+    match state.session_store.load(&id) {
+        Ok(d) => Json(json!({"ok":true,"session":d})),
+        Err(e) => Json(json!({"ok":false,"error":e.to_string()})),
     }
-
-    fn method_not_found(method: &str) -> Self {
-        Self {
-            code: -32601,
-            message: format!("unsupported method: {method}"),
-            data: None,
-        }
+}
+async fn session_delete_handler(State(state): State<AppState>, axum::extract::Path(id): axum::extract::Path<String>) -> Json<Value> {
+    match state.session_store.delete(&id) {
+        Ok(()) => Json(json!({"ok":true,"deleted":id})),
+        Err(e) => Json(json!({"ok":false,"error":e.to_string()})),
     }
-
-    fn invalid_params(message: impl Into<String>) -> Self {
-        Self {
-            code: -32602,
-            message: message.into(),
-            data: None,
-        }
+}
+async fn session_export_handler(State(state): State<AppState>, axum::extract::Path(id): axum::extract::Path<String>, Json(p): Json<SessionExportParams>) -> Json<Value> {
+    let out = p.output_path.map(PathBuf::from).unwrap_or_else(|| PathBuf::from(format!("{}.ds-session",&id[..8.min(id.len())])));
+    match deepseek_session::export_session(&state.session_store, &id, &out) {
+        Ok(()) => Json(json!({"ok":true,"session_id":id,"output_path":out.display().to_string()})),
+        Err(e) => Json(json!({"ok":false,"error":e.to_string()})),
     }
-
-    fn internal(message: impl Into<String>) -> Self {
-        Self {
-            code: -32603,
-            message: message.into(),
-            data: None,
-        }
+}
+async fn session_import_handler(State(state): State<AppState>, Json(p): Json<SessionImportParams>) -> Json<Value> {
+    match deepseek_session::import_session(&state.session_store, &PathBuf::from(&p.archive_path), p.overwrite) {
+        Ok(d) => Json(json!({"ok":true,"session_id":d.manifest.id,"name":d.manifest.name,"turn_count":d.turns.len()})),
+        Err(e) => Json(json!({"ok":false,"error":e.to_string()})),
     }
 }
 
-async fn handle_thread_request(
-    state: &AppState,
-    req: ThreadRequest,
-) -> std::result::Result<ThreadResponse, JsonRpcError> {
-    let mut runtime = state.runtime.lock().await;
-    runtime
-        .handle_thread(req)
-        .await
-        .map_err(|err| JsonRpcError::internal(err.to_string()))
+// ── Daemon handlers ────────────────────────────────────────────────────────
+
+async fn daemon_detach_handler(State(state): State<AppState>) -> Json<Value> {
+    state.daemon.set_detached(true);
+    info!("detached via API");
+    Json(json!({"ok":true,"detached":true}))
+}
+async fn daemon_attach_handler(State(state): State<AppState>) -> Json<Value> {
+    let cid = state.daemon.client_connect().await;
+    Json(json!({"ok":true,"client_id":cid,"connected_clients":state.daemon.connected_count().await}))
+}
+async fn daemon_status_handler(State(state): State<AppState>) -> Json<Value> {
+    Json(json!({"ok":true,"detached":state.daemon.is_detached(),"connected_clients":state.daemon.connected_count().await,"active_tasks":state.daemon.active_task_count(),"auto_shutdown_idle":state.daemon.should_auto_shutdown(),"started_at":state.daemon.started_at}))
 }
 
-async fn handle_prompt_request(
-    state: &AppState,
-    req: PromptRequest,
-) -> std::result::Result<PromptResponse, JsonRpcError> {
-    let mut runtime = state.runtime.lock().await;
-    runtime
-        .handle_prompt(req, &CliRuntimeOverrides::default())
-        .await
-        .map_err(|err| JsonRpcError::internal(err.to_string()))
+// ── Daemon resume / progress handlers ──────────────────────────────────────
+
+async fn daemon_resume_handler(State(state): State<AppState>) -> Json<Value> {
+    let suggestion = state.supervisor.build_resume_suggestion().await;
+    Json(json!({"ok":true,"resume":suggestion}))
 }
 
-async fn dispatch_stdio_request(
-    state: &AppState,
-    method: &str,
-    params: Value,
-) -> std::result::Result<StdioDispatchResult, JsonRpcError> {
-    let outcome = match method {
-        "healthz" | "app/healthz" => StdioDispatchResult {
-            result: json!({
-                "status": "ok",
-                "service": "deepseek-app-server",
-                "transport": "stdio"
-            }),
-            should_exit: false,
-        },
-        "capabilities" => StdioDispatchResult {
-            result: json!({
-                "transport": "stdio",
-                "families": ["thread/*", "app/*", "prompt/*"],
-                "methods": [
-                    "healthz",
-                    "thread/capabilities",
-                    "thread/request",
-                    "thread/create",
-                    "thread/start",
-                    "thread/resume",
-                    "thread/fork",
-                    "thread/list",
-                    "thread/read",
-                    "thread/set_name",
-                    "thread/archive",
-                    "thread/unarchive",
-                    "thread/message",
-                    "app/capabilities",
-                    "app/request",
-                    "app/config/get",
-                    "app/config/set",
-                    "app/config/unset",
-                    "app/config/list",
-                    "app/models",
-                    "app/thread_loaded_list",
-                    "prompt/capabilities",
-                    "prompt/request",
-                    "prompt/run",
-                    "shutdown"
-                ]
-            }),
-            should_exit: false,
-        },
-        "thread/capabilities" => StdioDispatchResult {
-            result: json!({
-                "methods": [
-                    "thread/request",
-                    "thread/create",
-                    "thread/start",
-                    "thread/resume",
-                    "thread/fork",
-                    "thread/list",
-                    "thread/read",
-                    "thread/set_name",
-                    "thread/archive",
-                    "thread/unarchive",
-                    "thread/message"
-                ]
-            }),
-            should_exit: false,
-        },
-        "thread/request" => {
-            let request: ThreadRequest = parse_params(params)?;
-            let response = handle_thread_request(state, request).await?;
-            StdioDispatchResult {
-                result: serde_json::to_value(response)
-                    .map_err(|err| JsonRpcError::internal(err.to_string()))?,
-                should_exit: false,
-            }
-        }
-        "thread/create" => {
-            #[derive(Debug, Deserialize)]
-            struct CreateParams {
-                #[serde(default)]
-                metadata: Value,
-            }
-            let parsed: CreateParams = parse_params(params_or_object(params))?;
-            let response = handle_thread_request(
-                state,
-                ThreadRequest::Create {
-                    metadata: parsed.metadata,
-                },
-            )
-            .await?;
-            StdioDispatchResult {
-                result: serde_json::to_value(response)
-                    .map_err(|err| JsonRpcError::internal(err.to_string()))?,
-                should_exit: false,
-            }
-        }
-        "thread/start" => {
-            let request = ThreadRequest::Start(parse_params(params_or_object(params))?);
-            let response = handle_thread_request(state, request).await?;
-            StdioDispatchResult {
-                result: serde_json::to_value(response)
-                    .map_err(|err| JsonRpcError::internal(err.to_string()))?,
-                should_exit: false,
-            }
-        }
-        "thread/resume" => {
-            let request = ThreadRequest::Resume(parse_params(params_or_object(params))?);
-            let response = handle_thread_request(state, request).await?;
-            StdioDispatchResult {
-                result: serde_json::to_value(response)
-                    .map_err(|err| JsonRpcError::internal(err.to_string()))?,
-                should_exit: false,
-            }
-        }
-        "thread/fork" => {
-            let request = ThreadRequest::Fork(parse_params(params_or_object(params))?);
-            let response = handle_thread_request(state, request).await?;
-            StdioDispatchResult {
-                result: serde_json::to_value(response)
-                    .map_err(|err| JsonRpcError::internal(err.to_string()))?,
-                should_exit: false,
-            }
-        }
-        "thread/list" => {
-            let request = ThreadRequest::List(parse_params(params_or_object(params))?);
-            let response = handle_thread_request(state, request).await?;
-            StdioDispatchResult {
-                result: serde_json::to_value(response)
-                    .map_err(|err| JsonRpcError::internal(err.to_string()))?,
-                should_exit: false,
-            }
-        }
-        "thread/read" => {
-            let request = ThreadRequest::Read(parse_params(params_or_object(params))?);
-            let response = handle_thread_request(state, request).await?;
-            StdioDispatchResult {
-                result: serde_json::to_value(response)
-                    .map_err(|err| JsonRpcError::internal(err.to_string()))?,
-                should_exit: false,
-            }
-        }
-        "thread/set_name" | "thread/set-name" => {
-            let request = ThreadRequest::SetName(parse_params(params_or_object(params))?);
-            let response = handle_thread_request(state, request).await?;
-            StdioDispatchResult {
-                result: serde_json::to_value(response)
-                    .map_err(|err| JsonRpcError::internal(err.to_string()))?,
-                should_exit: false,
-            }
-        }
-        "thread/archive" => {
-            let parsed: ThreadIdParams = parse_params(params_or_object(params))?;
-            let response = handle_thread_request(
-                state,
-                ThreadRequest::Archive {
-                    thread_id: parsed.thread_id,
-                },
-            )
-            .await?;
-            StdioDispatchResult {
-                result: serde_json::to_value(response)
-                    .map_err(|err| JsonRpcError::internal(err.to_string()))?,
-                should_exit: false,
-            }
-        }
-        "thread/unarchive" => {
-            let parsed: ThreadIdParams = parse_params(params_or_object(params))?;
-            let response = handle_thread_request(
-                state,
-                ThreadRequest::Unarchive {
-                    thread_id: parsed.thread_id,
-                },
-            )
-            .await?;
-            StdioDispatchResult {
-                result: serde_json::to_value(response)
-                    .map_err(|err| JsonRpcError::internal(err.to_string()))?,
-                should_exit: false,
-            }
-        }
-        "thread/message" => {
-            let parsed: ThreadMessageParams = parse_params(params_or_object(params))?;
-            let response = handle_thread_request(
-                state,
-                ThreadRequest::Message {
-                    thread_id: parsed.thread_id,
-                    input: parsed.input,
-                },
-            )
-            .await?;
-            StdioDispatchResult {
-                result: serde_json::to_value(response)
-                    .map_err(|err| JsonRpcError::internal(err.to_string()))?,
-                should_exit: false,
-            }
-        }
-        "app/capabilities" => {
-            let response = process_app_request(state, AppRequest::Capabilities).await;
-            StdioDispatchResult {
-                result: serde_json::to_value(response)
-                    .map_err(|err| JsonRpcError::internal(err.to_string()))?,
-                should_exit: false,
-            }
-        }
-        "app/request" => {
-            let request: AppRequest = parse_params(params)?;
-            let response = process_app_request(state, request).await;
-            StdioDispatchResult {
-                result: serde_json::to_value(response)
-                    .map_err(|err| JsonRpcError::internal(err.to_string()))?,
-                should_exit: false,
-            }
-        }
-        "app/config/get" => {
-            let parsed: ConfigGetParams = parse_params(params_or_object(params))?;
-            let response =
-                process_app_request(state, AppRequest::ConfigGet { key: parsed.key }).await;
-            StdioDispatchResult {
-                result: serde_json::to_value(response)
-                    .map_err(|err| JsonRpcError::internal(err.to_string()))?,
-                should_exit: false,
-            }
-        }
-        "app/config/set" => {
-            let parsed: ConfigSetParams = parse_params(params_or_object(params))?;
-            let response = process_app_request(
-                state,
-                AppRequest::ConfigSet {
-                    key: parsed.key,
-                    value: parsed.value,
-                },
-            )
-            .await;
-            StdioDispatchResult {
-                result: serde_json::to_value(response)
-                    .map_err(|err| JsonRpcError::internal(err.to_string()))?,
-                should_exit: false,
-            }
-        }
-        "app/config/unset" => {
-            let parsed: ConfigGetParams = parse_params(params_or_object(params))?;
-            let response =
-                process_app_request(state, AppRequest::ConfigUnset { key: parsed.key }).await;
-            StdioDispatchResult {
-                result: serde_json::to_value(response)
-                    .map_err(|err| JsonRpcError::internal(err.to_string()))?,
-                should_exit: false,
-            }
-        }
-        "app/config/list" => {
-            let response = process_app_request(state, AppRequest::ConfigList).await;
-            StdioDispatchResult {
-                result: serde_json::to_value(response)
-                    .map_err(|err| JsonRpcError::internal(err.to_string()))?,
-                should_exit: false,
-            }
-        }
-        "app/models" => {
-            let response = process_app_request(state, AppRequest::Models).await;
-            StdioDispatchResult {
-                result: serde_json::to_value(response)
-                    .map_err(|err| JsonRpcError::internal(err.to_string()))?,
-                should_exit: false,
-            }
-        }
-        "app/thread_loaded_list" | "app/thread-loaded-list" => {
-            let response = process_app_request(state, AppRequest::ThreadLoadedList).await;
-            StdioDispatchResult {
-                result: serde_json::to_value(response)
-                    .map_err(|err| JsonRpcError::internal(err.to_string()))?,
-                should_exit: false,
-            }
-        }
-        "prompt/capabilities" => StdioDispatchResult {
-            result: json!({
-                "methods": ["prompt/request", "prompt/run"]
-            }),
-            should_exit: false,
-        },
-        "prompt/request" | "prompt/run" => {
-            let request: PromptRequest = parse_params(params)?;
-            let response = handle_prompt_request(state, request).await?;
-            StdioDispatchResult {
-                result: serde_json::to_value(response)
-                    .map_err(|err| JsonRpcError::internal(err.to_string()))?,
-                should_exit: false,
-            }
-        }
-        "shutdown" => StdioDispatchResult {
-            result: json!({"ok": true, "status": "stopped"}),
-            should_exit: true,
-        },
-        _ => return Err(JsonRpcError::method_not_found(method)),
+async fn daemon_progress_handler(State(state): State<AppState>) -> Json<Value> {
+    let progress = state.supervisor.recent_progress(50).await;
+    Json(json!({"ok":true,"progress":progress,"count":progress.len()}))
+}
+
+async fn daemon_checkpoint_handler(State(state): State<AppState>) -> Json<Value> {
+    match state.supervisor.checkpoint_hive().await {
+        Ok(()) => Json(json!({"ok":true,"message":"checkpoint saved"})),
+        Err(e) => Json(json!({"ok":false,"error":e.to_string()})),
+    }
+}
+
+// ── Swarm / hive handlers ──────────────────────────────────────────────────
+
+async fn swarm_agents_handler(State(state): State<AppState>) -> Json<Value> {
+    Json(json!({"ok":true,"agents":state.swarm.list_agents().await}))
+}
+async fn swarm_spawn_handler(State(state): State<AppState>, Json(body): Json<Value>) -> Json<Value> {
+    let role = match body.get("role").and_then(|v| v.as_str()).unwrap_or("general").to_lowercase().as_str() {
+        "explorer" => AgentRole::Explorer, "implementer" => AgentRole::Implementer,
+        "reviewer" => AgentRole::Reviewer, "tester" => AgentRole::Tester,
+        "planner" => AgentRole::Planner, "coordinator" => AgentRole::Coordinator,
+        _ => AgentRole::General,
     };
-    Ok(outcome)
+    let name = body.get("name").and_then(|v| v.as_str()).unwrap_or("unnamed");
+    let h = state.swarm.spawn_agent(AgentSpec::for_role(role, name)).await;
+    let agent_id = h.id.clone();
+    let agent_role_label = h.role.label().to_string();
+    let agent_name = h.name.clone();
+    let supervisor = state.supervisor.clone();
+    let daemon = state.daemon.clone();
+    state.daemon.task_started();
+    state.supervisor.agent_started(&agent_id, &agent_role_label, &agent_name).await;
+
+    // Background listener: log when agent completes
+    let role_for_log = agent_role_label.clone();
+    let agent_id_for_log = agent_id.clone();
+    tokio::spawn(async move {
+        let result = h.await_completion().await;
+        daemon.task_finished();
+        let summary = result.as_ref()
+            .map(|r| r.output.as_str())
+            .unwrap_or("agent finished");
+        supervisor.agent_completed(&agent_id_for_log, &role_for_log, summary).await;
+    });
+
+    Json(json!({"ok":true,"agent_id":agent_id,"role":agent_role_label,"name":agent_name}))
 }
+async fn hive_query_handler(State(state): State<AppState>, axum::extract::Path(key): axum::extract::Path<String>) -> Json<Value> {
+    match state.swarm.hive.query(&key).await {
+        Some(e) => Json(json!({"ok":true,"entry":e})),
+        None => Json(json!({"ok":false,"error":"not found"})),
+    }
+}
+async fn hive_inject_handler(State(state): State<AppState>, Json(body): Json<Value>) -> Json<Value> {
+    let key = body.get("key").and_then(|v| v.as_str()).unwrap_or("");
+    let value = body.get("value").cloned().unwrap_or(Value::Null);
+    let author = body.get("author").and_then(|v| v.as_str()).unwrap_or("api");
+    let tags: Vec<String> = body.get("tags").and_then(|v| v.as_array()).map(|a| a.iter().filter_map(|v| v.as_str().map(String::from)).collect()).unwrap_or_default();
+    let conf = body.get("confidence").and_then(|v| v.as_f64()).unwrap_or(0.8);
+    match state.swarm.hive.inject(key, value, author, tags, conf).await {
+        Ok(v) => Json(json!({"ok":true,"key":key,"version":v})),
+        Err(e) => Json(json!({"ok":false,"error":e.to_string()})),
+    }
+}
+async fn hive_summary_handler(State(state): State<AppState>) -> Json<Value> {
+    Json(json!({"ok":true,"summary":state.swarm.hive.summary().await,"entry_count":state.swarm.hive.len().await}))
+}
+async fn hive_snapshot_handler(State(state): State<AppState>) -> Json<Value> {
+    Json(json!({"ok":true,"entries":state.swarm.hive.snapshot().await}))
+}
+
+// ── Stdio ──────────────────────────────────────────────────────────────────
+
+pub async fn run_stdio(config_path: Option<PathBuf>) -> Result<()> {
+    let opts = AppServerOptions { listen: "127.0.0.1:0".parse().unwrap(), config_path, daemon: false, pid_file: None, auto_shutdown_idle: false, idle_timeout_secs: 300 };
+    let state = build_state(&opts)?;
+    let mut reader = BufReader::new(tokio::io::stdin()).lines();
+    let mut writer = tokio::io::BufWriter::new(tokio::io::stdout());
+    while let Some(line) = reader.next_line().await? {
+        if line.trim().is_empty() { continue; }
+        let req: JsonRpcRequest = match serde_json::from_str(&line) {
+            Ok(v) => v,
+            Err(e) => {
+                let r = jsonrpc_error(None, JsonRpcError::parse_error(format!("invalid json: {e}")));
+                writer.write_all(r.to_string().as_bytes()).await?; writer.write_all(b"\n").await?; writer.flush().await?; continue;
+            }
+        };
+        if req.jsonrpc.as_deref().is_some_and(|v| v != "2.0") {
+            let r = jsonrpc_error(req.id, JsonRpcError::invalid_request("jsonrpc version must be 2.0"));
+            writer.write_all(r.to_string().as_bytes()).await?; writer.write_all(b"\n").await?; writer.flush().await?; continue;
+        }
+        match dispatch_stdio(&state, &req.method, req.params).await {
+            Ok(d) => {
+                let enc = jsonrpc_result(req.id, d.result);
+                writer.write_all(enc.to_string().as_bytes()).await?; writer.write_all(b"\n").await?; writer.flush().await?;
+                if d.should_exit { break; }
+            }
+            Err(e) => {
+                let r = jsonrpc_error(req.id, e);
+                writer.write_all(r.to_string().as_bytes()).await?; writer.write_all(b"\n").await?; writer.flush().await?;
+            }
+        }
+    }
+    Ok(())
+}
+
+async fn dispatch_stdio(state: &AppState, method: &str, params: Value) -> std::result::Result<StdioDispatchResult, JsonRpcError> {
+    match method {
+        "healthz" | "app/healthz" => Ok(StdioDispatchResult { result: json!({"status":"ok","service":"deepseek-app-server","transport":"stdio"}), should_exit: false }),
+        "shutdown" => Ok(StdioDispatchResult { result: json!({"ok":true}), should_exit: true }),
+        _ => {
+            let mut rt = state.runtime.lock().await;
+            match method {
+                "thread/request" => { let r: ThreadRequest = parse_params(params)?; Ok(StdioDispatchResult { result: serde_json::to_value(rt.handle_thread(r).await.map_err(|e| JsonRpcError::internal(e.to_string()))?).unwrap(), should_exit: false }) }
+                "thread/create" => { let r = ThreadRequest::Create { metadata: params_or_object(params) }; Ok(StdioDispatchResult { result: serde_json::to_value(rt.handle_thread(r).await.map_err(|e| JsonRpcError::internal(e.to_string()))?).unwrap(), should_exit: false }) }
+                "thread/list" => { let r = ThreadRequest::List(parse_params(params_or_object(params))?); Ok(StdioDispatchResult { result: serde_json::to_value(rt.handle_thread(r).await.map_err(|e| JsonRpcError::internal(e.to_string()))?).unwrap(), should_exit: false }) }
+                "thread/read" => { let r = ThreadRequest::Read(parse_params(params_or_object(params))?); Ok(StdioDispatchResult { result: serde_json::to_value(rt.handle_thread(r).await.map_err(|e| JsonRpcError::internal(e.to_string()))?).unwrap(), should_exit: false }) }
+                "prompt/request" | "prompt/run" => { let r: PromptRequest = parse_params(params)?; Ok(StdioDispatchResult { result: serde_json::to_value(rt.handle_prompt(r, &CliRuntimeOverrides::default()).await.map_err(|e| JsonRpcError::internal(e.to_string()))?).unwrap(), should_exit: false }) }
+                "daemon/detach" => { state.daemon.set_detached(true); Ok(StdioDispatchResult { result: json!({"ok":true}), should_exit: false }) }
+                "daemon/status" => { Ok(StdioDispatchResult { result: json!({"ok":true,"detached":state.daemon.is_detached(),"active_tasks":state.daemon.active_task_count()}), should_exit: false }) }
+                "hive/summary" => { Ok(StdioDispatchResult { result: json!({"ok":true,"summary":state.swarm.hive.summary().await}), should_exit: false }) }
+                "hive/snapshot" => { Ok(StdioDispatchResult { result: json!({"ok":true,"entries":state.swarm.hive.snapshot().await}), should_exit: false }) }
+                _ => Err(JsonRpcError::method_not_found(method)),
+            }
+        }
+    }
+}
+
+// ── App request processing ─────────────────────────────────────────────────
 
 async fn process_app_request(state: &AppState, req: AppRequest) -> AppResponse {
     match req {
         AppRequest::Capabilities => AppResponse {
             ok: true,
-            data: json!({
-                "routes": ["/thread", "/app", "/prompt", "/tool", "/jobs", "/mcp/startup"],
-                "config": ["get", "set", "unset", "list"],
-                "events": ["response_start", "response_delta", "response_end", "tool_call_start", "tool_call_result", "mcp_startup_update", "mcp_startup_complete"],
-                "transport": "stdio+http",
-                "config_path": state.config_path.as_ref().map(|p| p.display().to_string()),
-            }),
-            events: Vec::new(),
+            data: json!({"routes":["/thread","/app","/prompt","/tool","/jobs","/mcp/startup","/sessions","/daemon/detach","/daemon/status","/swarm/agents","/swarm/spawn","/hive/query","/hive/inject","/hive/summary","/hive/snapshot","/daemon/resume","/daemon/progress","/daemon/checkpoint"],"config":["get","set","unset","list"],"transport":"stdio+http"}),
+            events: vec![],
         },
         AppRequest::ConfigGet { key } => {
             let cfg = state.config.read().await;
-            AppResponse {
-                ok: true,
-                data: json!({ "key": key, "value": cfg.get_value(&key) }),
-                events: Vec::new(),
-            }
+            AppResponse { ok: true, data: json!({"key":key,"value":cfg.get_value(&key)}), events: vec![] }
         }
         AppRequest::ConfigSet { key, value } => {
             let mut cfg = state.config.write().await;
-            let result = cfg.set_value(&key, &value);
-            let ok = result.is_ok();
-            let message = result.err().map(|e| e.to_string());
-            let snapshot = cfg.clone();
-            drop(cfg);
-            let _ = persist_config(state, snapshot).await;
-            AppResponse {
-                ok,
-                data: json!({ "key": key, "value": value, "error": message }),
-                events: Vec::new(),
-            }
+            let r = cfg.set_value(&key, &value);
+            let ok = r.is_ok(); let msg = r.err().map(|e| e.to_string());
+            let snap = cfg.clone(); drop(cfg);
+            if let Err(e) = persist_config(state, snap).await { warn!(%e, "config persist failed"); }
+            AppResponse { ok, data: json!({"key":key,"value":value,"error":msg}), events: vec![] }
         }
         AppRequest::ConfigUnset { key } => {
             let mut cfg = state.config.write().await;
-            let result = cfg.unset_value(&key);
-            let ok = result.is_ok();
-            let message = result.err().map(|e| e.to_string());
-            let snapshot = cfg.clone();
-            drop(cfg);
-            let _ = persist_config(state, snapshot).await;
-            AppResponse {
-                ok,
-                data: json!({ "key": key, "error": message }),
-                events: Vec::new(),
-            }
+            let r = cfg.unset_value(&key);
+            let ok = r.is_ok(); let msg = r.err().map(|e| e.to_string());
+            let snap = cfg.clone(); drop(cfg);
+            if let Err(e) = persist_config(state, snap).await { warn!(%e, "config persist failed"); }
+            AppResponse { ok, data: json!({"key":key,"error":msg}), events: vec![] }
         }
         AppRequest::ConfigList => {
             let cfg = state.config.read().await;
-            AppResponse {
-                ok: true,
-                data: json!({ "values": cfg.list_values() }),
-                events: Vec::new(),
-            }
+            AppResponse { ok: true, data: json!({"values":cfg.list_values()}), events: vec![] }
         }
-        AppRequest::Models => AppResponse {
-            ok: true,
-            data: json!({ "models": state.registry.list() }),
-            events: Vec::new(),
-        },
+        AppRequest::Models => AppResponse { ok: true, data: json!({"models":state.registry.list()}), events: vec![] },
         AppRequest::ThreadLoadedList => {
-            let mut runtime = state.runtime.lock().await;
-            let response = runtime
-                .handle_thread(deepseek_protocol::ThreadRequest::List(
-                    deepseek_protocol::ThreadListParams {
-                        include_archived: false,
-                        limit: Some(50),
-                    },
-                ))
-                .await;
-            match response {
-                Ok(thread_resp) => AppResponse {
-                    ok: true,
-                    data: json!({ "threads": thread_resp.threads }),
-                    events: thread_resp.events,
-                },
-                Err(err) => AppResponse {
-                    ok: false,
-                    data: json!({ "error": err.to_string() }),
-                    events: Vec::new(),
-                },
+            let mut rt = state.runtime.lock().await;
+            match rt.handle_thread(ThreadRequest::List(ThreadListParams { include_archived: false, limit: Some(50) })).await {
+                Ok(r) => AppResponse { ok: true, data: json!({"threads":r.threads}), events: r.events },
+                Err(e) => AppResponse { ok: false, data: json!({"error":e.to_string()}), events: vec![] },
             }
         }
     }
 }
 
+// ── State construction ─────────────────────────────────────────────────────
+
+fn build_state(options: &AppServerOptions) -> Result<AppState> {
+    let store = ConfigStore::load(options.config_path.clone())?;
+    let config = store.config.clone();
+    let registry = ModelRegistry::default();
+    let state_db = options.config_path.as_ref().and_then(|p| p.parent().map(|x| x.join("state.db")));
+    let state_store = StateStore::open(state_db)?;
+    let mut hooks = HookDispatcher::default();
+    hooks.add_sink(Arc::new(StdoutHookSink));
+    let hl = options.config_path.as_ref().and_then(|p| p.parent().map(|x| x.join("events.jsonl"))).unwrap_or_else(|| PathBuf::from(".deepseek/events.jsonl"));
+    hooks.add_sink(Arc::new(JsonlHookSink::new(hl)));
+    let runtime = Runtime::new(config.clone(), registry.clone(), state_store, Arc::new(ToolRegistry::default()), Arc::new(McpManager::default()), ExecPolicyEngine::new(vec![], vec![]), hooks);
+    let session_store = match SessionStore::default_store() {
+        Ok(s) => Arc::new(s),
+        Err(e) => { warn!(%e, "session store fallback"); Arc::new(SessionStore::new(std::env::temp_dir().join("deepseek-sessions"))) }
+    };
+    let daemon = Arc::new(DaemonState::new(options.auto_shutdown_idle, options.idle_timeout_secs));
+    let swarm = Arc::new(SwarmOrchestrator::new());
+    let context_store = {
+        let db_path = options.config_path.as_ref()
+            .and_then(|p| p.parent().map(|x| x.join("context.db")))
+            .unwrap_or_else(|| PathBuf::from(".deepseek/context.db"));
+        Arc::new(HybridContextStore::open(&db_path).unwrap_or_else(|e| {
+            warn!(%e, "context store fallback to in-memory");
+            HybridContextStore::open_in_memory().expect("in-memory context store")
+        }))
+    };
+    let supervisor = {
+        let log_path = options.config_path.as_ref()
+            .and_then(|p| p.parent().map(|x| x.join("daemon.log")))
+            .unwrap_or_else(|| PathBuf::from(".deepseek/daemon.log"));
+        Arc::new(DaemonSupervisor::new(
+            context_store.clone(),
+            session_store.clone(),
+            swarm.clone(),
+            Some(log_path),
+        ))
+    };
+    Ok(AppState { config_path: options.config_path.clone(), config: Arc::new(RwLock::new(config)), runtime: Arc::new(tokio::sync::Mutex::new(runtime)), registry, session_store, daemon, swarm, context_store, supervisor })
+}
+
 async fn persist_config(state: &AppState, config: deepseek_config::ConfigToml) -> Result<()> {
-    if state.config_path.is_none() {
-        return Ok(());
-    }
+    if state.config_path.is_none() { return Ok(()); }
     let mut store = ConfigStore::load(state.config_path.clone())?;
     store.config = config;
     store.save()
+}
+
+// ── Helpers ────────────────────────────────────────────────────────────────
+
+fn params_or_object(params: Value) -> Value { if params.is_null() { json!({}) } else { params } }
+fn parse_params<T: DeserializeOwned>(params: Value) -> std::result::Result<T, JsonRpcError> {
+    serde_json::from_value(params).map_err(|e| JsonRpcError::invalid_params(e.to_string()))
+}
+fn jsonrpc_result(id: Option<Value>, result: Value) -> Value {
+    json!({"jsonrpc":"2.0","id":id.unwrap_or(Value::Null),"result":result})
+}
+fn jsonrpc_error(id: Option<Value>, err: JsonRpcError) -> Value {
+    json!({"jsonrpc":"2.0","id":id.unwrap_or(Value::Null),"error":{"code":err.code,"message":err.message,"data":err.data}})
+}
+impl JsonRpcError {
+    fn parse_error(m: impl Into<String>) -> Self { Self { code: -32700, message: m.into(), data: None } }
+    fn invalid_request(m: impl Into<String>) -> Self { Self { code: -32600, message: m.into(), data: None } }
+    fn method_not_found(m: &str) -> Self { Self { code: -32601, message: format!("unsupported method: {m}"), data: None } }
+    fn invalid_params(m: impl Into<String>) -> Self { Self { code: -32602, message: m.into(), data: None } }
+    fn internal(m: impl Into<String>) -> Self { Self { code: -32603, message: m.into(), data: None } }
 }

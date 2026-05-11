@@ -1,0 +1,27 @@
+[Unit]
+Description=DeepSeek TUI Daemon — AI-powered terminal workspace
+After=network.target
+Documentation=https://github.com/DeepSeek-TUI/DeepSeek-TUI
+
+[Service]
+Type=simple
+User=boottify
+Group=boottify
+WorkingDirectory=/var/www/tui/repo
+Environment=RUST_LOG=info
+ExecStart=/usr/local/bin/deepseek serve --host 0.0.0.0 --port 8787
+Restart=always
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+
+# Security hardening
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=/var/www/tui/repo/.deepseek
+ReadOnlyPaths=/var/www/tui/repo
+
+[Install]
+WantedBy=multi-user.target

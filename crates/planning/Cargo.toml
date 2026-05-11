@@ -1,0 +1,17 @@
+[package]
+name = "deepseek-planning"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Planning directory system: structured artifacts, phase workflow, spec-driven development for DeepSeek workspace architecture"
+
+[dependencies]
+anyhow.workspace = true
+chrono.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+uuid.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

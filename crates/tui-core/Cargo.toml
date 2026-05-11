@@ -5,3 +5,8 @@ edition.workspace = true
 license.workspace = true
 repository.workspace = true
 description = "Event-driven TUI state machine scaffold for DeepSeek workspace architecture"
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+smallvec.workspace = true
