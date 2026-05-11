@@ -301,6 +301,10 @@ pub enum UiEvent {
     Tick,
     /// Tab pressed — trigger path/file autocompletion.
     TabPressed,
+    /// Tab pressed — trigger path/file/slash autocompletion (does NOT cycle mode).
+    CompletionTrigger,
+    /// Ctrl+Tab pressed — cycle between Plan / Agent / YOLO modes.
+    CtrlTabPressed,
     /// Backspace in the input buffer (for path completion tracking).
     BackspacePressed,
     /// Cycle to next path completion candidate.
@@ -345,6 +349,8 @@ pub enum UiEffect {
     ExecuteSlashCommand(SlashCommand),
     /// Attach a file to the current conversation (triggered by `@path`).
     AttachFile(String),
+    /// Toggle between Plan / Agent / YOLO modes (triggered by Ctrl+Tab).
+    ToggleMode,
     /// Show slash command completion suggestions.
     ShowSlashSuggestions(Vec<String>),
     /// Show the slash command popup menu with structured data.
@@ -778,6 +784,17 @@ impl BracketedPasteBuffer {
                     i += 6;
                     continue;
                 }
+                // Ctrl+Tab: \x1b[1;5I (most terminals) or \x1b[27;5;9~ (some)
+                if bytes[i..].starts_with(b"\x1b[1;5I") {
+                    events.push(UiEvent::CtrlTabPressed);
+                    i += 6;
+                    continue;
+                }
+                if bytes[i..].starts_with(b"\x1b[27;5;9~") {
+                    events.push(UiEvent::CtrlTabPressed);
+                    i += 8;
+                    continue;
+                }
                 // OSC 52 clipboard response: \x1b]52;...\x07 or \x1b]52;...\x1b\\
                 if bytes[i..].starts_with(b"\x1b]52;") {
                     i = skip_osc_52(bytes, i, &mut events);
@@ -791,7 +808,7 @@ impl BracketedPasteBuffer {
                 // Regular character — map special keys to dedicated events
                 let byte = bytes[i];
                 match byte {
-                    b'\t' => events.push(UiEvent::TabPressed),
+                    b'\t' => events.push(UiEvent::CompletionTrigger),
                     b'\x7f' | b'\x08' => events.push(UiEvent::BackspacePressed),
                     b'\r' => events.push(UiEvent::EnterPressed),
                     b'\n' => events.push(UiEvent::KeyPressed('\n')), // newline for multi-line
@@ -1734,7 +1751,9 @@ impl UiState {
                     UiEffect::EmitContextWarning(msg),
                 ]
             }
-            UiEvent::TabPressed => {
+            // Tab now triggers ONLY completion (Ctrl+Tab cycles mode).
+            // The renderer intercepts CtrlTabPressed for mode cycling.
+            UiEvent::TabPressed | UiEvent::CompletionTrigger => {
                 // First check path completer
                 if let Some(ref mut pc) = self.path_completer {
                     if pc.active {
@@ -1810,6 +1829,14 @@ impl UiState {
                     }
                 }
                 smallvec![]
+            }
+            UiEvent::CtrlTabPressed => {
+                self.status_line = "mode toggled".into();
+                smallvec![
+                    UiEffect::Render,
+                    UiEffect::ToggleMode,
+                    UiEffect::EmitStatusLine(self.status_line.clone()),
+                ]
             }
             UiEvent::BackspacePressed => {
                 self.input_buffer.pop();
