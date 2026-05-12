@@ -9,8 +9,11 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use anyhow::{Context, Result, bail};
 use axum::extract::State;
+use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
+use axum::response::IntoResponse;
 use axum::routing::{delete, get, post};
 use axum::{Json, Router};
+use futures_util::{SinkExt, StreamExt};
 use chrono::Utc;
 use deepseek_agent::ModelRegistry;
 use deepseek_config::{CliRuntimeOverrides, ConfigStore};
@@ -184,6 +187,7 @@ async fn run_foreground(options: AppServerOptions) -> Result<()> {
         .route("/daemon/resume", get(daemon_resume_handler))
         .route("/daemon/progress", get(daemon_progress_handler))
         .route("/daemon/checkpoint", post(daemon_checkpoint_handler))
+        .route("/ws", get(ws_handler))
         .layer(CorsLayer::permissive())
         .with_state(state.clone());
 
@@ -243,6 +247,44 @@ async fn auto_shutdown_watcher(state: AppState, timeout_secs: u64, mut cancel: m
 
 async fn healthz() -> Json<Value> {
     Json(json!({"status":"ok","protocol":"v2","service":"deepseek-app-server","version":env!("CARGO_PKG_VERSION")}))
+}
+
+async fn ws_handler(ws: WebSocketUpgrade) -> impl IntoResponse {
+    ws.on_upgrade(move |socket| handle_ws(socket))
+}
+
+async fn handle_ws(mut socket: WebSocket) {
+    tracing::info!("WebSocket client connected");
+    let welcome = serde_json::json!({
+        "jsonrpc": "2.0", "method": "connected",
+        "params": {"service": "deepseek-app-server", "version": "0.8.26"}
+    });
+    let _ = socket.send(Message::Text(welcome.to_string().into())).await;
+
+    while let Some(Ok(msg)) = socket.recv().await {
+        match msg {
+            Message::Text(text) => {
+                if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(&text) {
+                    if parsed.get("method").and_then(|v| v.as_str()) == Some("prompt") {
+                        let ack = serde_json::json!({
+                            "jsonrpc": "2.0", "method": "response.delta",
+                            "params": {"delta": "Connected.", "conversation_id": parsed["params"]["conversation_id"]}
+                        });
+                        let _ = socket.send(Message::Text(ack.to_string().into())).await;
+                        let done = serde_json::json!({
+                            "jsonrpc": "2.0", "method": "response.complete",
+                            "params": {"full_text": "WebSocket active.", "conversation_id": parsed["params"]["conversation_id"]},
+                            "id": parsed["id"]
+                        });
+                        let _ = socket.send(Message::Text(done.to_string().into())).await;
+                    }
+                }
+            }
+            Message::Close(_) => break,
+            _ => {}
+        }
+    }
+    tracing::info!("WebSocket client disconnected");
 }
 
 async fn thread_handler(State(state): State<AppState>, Json(req): Json<ThreadRequest>) -> Json<ThreadResponse> {

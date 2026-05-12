@@ -8,7 +8,8 @@ description = "Codex-style app-server transport for DeepSeek workspace architect
 
 [dependencies]
 anyhow.workspace = true
-axum.workspace = true
+axum = { workspace = true, features = ["ws"] }
+futures-util = "0.3"
 chrono.workspace = true
 clap.workspace = true
 deepseek-agent = { workspace = true }

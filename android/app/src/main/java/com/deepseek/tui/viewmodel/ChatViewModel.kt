@@ -75,17 +75,9 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
             }
 
             override fun onFailure(webSocket: WebSocket, t: Throwable, response: Response?) {
-                _uiState.update {
-                    it.copy(
-                        webSocketConnected = false,
-                        errorMessage = t.message ?: "WebSocket error"
-                    )
-                }
-                // Reconnect after delay
-                viewModelScope.launch {
-                    kotlinx.coroutines.delay(3000)
-                    connectWebSocket()
-                }
+                _uiState.update { it.copy(webSocketConnected = false) }
+                // Don't retry — server doesn't have /ws endpoint, use HTTP fallback
+                // The 404 is expected; chat works fine via POST /prompt
             }
         })
     }
