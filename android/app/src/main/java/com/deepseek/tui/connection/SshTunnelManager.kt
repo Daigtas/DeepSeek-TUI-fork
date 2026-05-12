@@ -108,9 +108,13 @@ class SshTunnelManager(private val context: Context) {
 
             // Android ships a stripped BouncyCastle without X25519/EdDSA.
             // Remove it and install the full provider from our dependencies.
-            Security.removeProvider(BouncyCastleProvider.PROVIDER_NAME)
-            Security.insertProviderAt(BouncyCastleProvider(), 1)
-            log("BouncyCastle provider installed (X25519/EdDSA enabled)")
+            try {
+                Security.removeProvider(BouncyCastleProvider.PROVIDER_NAME)
+                Security.insertProviderAt(BouncyCastleProvider(), 1)
+                log("BouncyCastle provider installed (X25519/EdDSA enabled)")
+            } catch (e: Exception) {
+                log("WARNING: BC provider setup failed: ${e.message}")
+            }
 
             val client = SSHClient()
             // Increase timeouts for slow connections

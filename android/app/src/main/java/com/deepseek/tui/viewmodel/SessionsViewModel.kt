@@ -37,7 +37,8 @@ class SessionsViewModel(application: Application) : AndroidViewModel(application
     private val _uiState = MutableStateFlow(SessionsUiState())
     val uiState: StateFlow<SessionsUiState> = _uiState.asStateFlow()
 
-    init { loadSessions() }
+    // Don't load sessions at init — wait for explicit refresh after connect
+    init {}
 
     fun loadSessions() {
         viewModelScope.launch {

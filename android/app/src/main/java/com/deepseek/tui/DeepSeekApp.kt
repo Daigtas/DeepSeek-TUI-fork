@@ -15,8 +15,12 @@ class DeepSeekApp : Application() {
 
         // Android ships a stripped BouncyCastle without X25519/EdDSA.
         // Replace with full provider before any SSH connections.
-        Security.removeProvider(BouncyCastleProvider.PROVIDER_NAME)
-        Security.insertProviderAt(BouncyCastleProvider(), 1)
+        try {
+            Security.removeProvider(BouncyCastleProvider.PROVIDER_NAME)
+            Security.insertProviderAt(BouncyCastleProvider(), 1)
+        } catch (e: Exception) {
+            android.util.Log.e("DeepSeekApp", "Failed to install BouncyCastle provider", e)
+        }
 
         appContainer = AppContainer(this)
     }
