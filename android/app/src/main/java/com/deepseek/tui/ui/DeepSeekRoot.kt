@@ -27,7 +27,10 @@ import com.deepseek.tui.connection.SshTunnelManager
 import com.deepseek.tui.ui.chat.ChatScreen
 import com.deepseek.tui.ui.dashboard.DashboardScreen
 import com.deepseek.tui.ui.navigation.NavigationDrawer
+import com.deepseek.tui.ui.hive.HiveScreen
+import com.deepseek.tui.ui.sessions.SessionsScreen
 import com.deepseek.tui.ui.settings.SettingsScreen
+import com.deepseek.tui.ui.swarm.SwarmScreen
 import com.deepseek.tui.ui.theme.*
 import com.deepseek.tui.viewmodel.*
 import kotlinx.coroutines.Dispatchers
@@ -50,6 +53,9 @@ fun DeepSeekRoot() {
     val connectionViewModel: ConnectionViewModel = viewModel(factory = ViewModelFactory { ConnectionViewModel(app) })
     val dashboardViewModel: DashboardViewModel = viewModel(factory = ViewModelFactory { DashboardViewModel(app) })
     val chatViewModel: ChatViewModel = viewModel(factory = ViewModelFactory { ChatViewModel(app) })
+    val sessionsViewModel: SessionsViewModel = viewModel(factory = ViewModelFactory { SessionsViewModel(app) })
+    val swarmViewModel: SwarmViewModel = viewModel(factory = ViewModelFactory { SwarmViewModel(app) })
+    val hiveViewModel: HiveViewModel = viewModel(factory = ViewModelFactory { HiveViewModel(app) })
 
     val connectionState by connectionViewModel.uiState.collectAsState()
     val dashboardState by dashboardViewModel.uiState.collectAsState()
@@ -59,6 +65,9 @@ fun DeepSeekRoot() {
     var selectedScreen by remember { mutableStateOf("chat") }
     var fontSize by remember { mutableFloatStateOf(14f) }
     var paneRatio by remember { mutableFloatStateOf(0.4f) }
+    val sessionsState by sessionsViewModel.uiState.collectAsState()
+    val swarmState by swarmViewModel.uiState.collectAsState()
+    val hiveState by hiveViewModel.uiState.collectAsState()
 
     // SSH key import launcher
     val keyImportLauncher = rememberLauncherForActivityResult(contract = ActivityResultContracts.OpenDocument()) { uri ->
@@ -156,6 +165,15 @@ fun DeepSeekRoot() {
                     NavigationBarItem(selected = selectedScreen == "dashboard", onClick = { selectedScreen = "dashboard" },
                         icon = { Icon(Icons.Filled.Dashboard, "Dashboard") }, label = { Text("Dashboard") },
                         colors = navColors())
+                    NavigationBarItem(selected = selectedScreen == "swarm", onClick = { selectedScreen = "swarm" },
+                        icon = { Icon(Icons.Filled.Group, "Swarm") }, label = { Text("Swarm") },
+                        colors = navColors())
+                    NavigationBarItem(selected = selectedScreen == "hive", onClick = { selectedScreen = "hive" },
+                        icon = { Icon(Icons.Filled.Storage, "Hive") }, label = { Text("Hive") },
+                        colors = navColors())
+                    NavigationBarItem(selected = selectedScreen == "sessions", onClick = { selectedScreen = "sessions" },
+                        icon = { Icon(Icons.Filled.History, "Sessions") }, label = { Text("Sessions") },
+                        colors = navColors())
                     NavigationBarItem(selected = selectedScreen == "settings", onClick = { selectedScreen = "settings" },
                         icon = { Icon(Icons.Filled.Settings, "Settings") }, label = { Text("Settings") },
                         colors = navColors())
@@ -167,6 +185,9 @@ fun DeepSeekRoot() {
             }) {
                 when (selectedScreen) {
                     "dashboard" -> DashboardScreen(connectionState, dashboardState, { connectionViewModel.disconnect() }, {}, {}, {}, Modifier.fillMaxSize())
+                    "swarm" -> SwarmScreen(swarmState, { swarmViewModel.refreshAgents() }, { r, n, p -> swarmViewModel.spawnAgent(r, n, p) }, { swarmViewModel.clearMessage() })
+                    "hive" -> HiveScreen(hiveState, { hiveViewModel.refreshSnapshot() }, { hiveViewModel.queryByKey(it) }, { k, v -> hiveViewModel.injectEntry(k, v) }, { _ -> }, { hiveViewModel.clearMessages() })
+                    "sessions" -> SessionsScreen(sessionsState, { sessionsViewModel.loadSessions() }, { sessionsViewModel.deleteSession(it) }, { sessionsViewModel.exportSession(it) })
                     "settings" -> SettingsScreen(fontSize, paneRatio, connectionState.config,
                         onFontSizeChanged = { fontSize = it }, onPaneRatioChanged = { paneRatio = it },
                         onConnectionConfigChanged = { connectionViewModel.saveConfig(it) },
