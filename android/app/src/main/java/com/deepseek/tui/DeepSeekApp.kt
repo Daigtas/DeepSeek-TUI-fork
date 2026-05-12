@@ -1,7 +1,8 @@
 package com.deepseek.tui
 
 import android.app.Application
-import android.util.Log
+import org.bouncycastle.jce.provider.BouncyCastleProvider
+import java.security.Security
 
 class DeepSeekApp : Application() {
 
@@ -11,6 +12,12 @@ class DeepSeekApp : Application() {
     override fun onCreate() {
         super.onCreate()
         instance = this
+
+        // Android ships a stripped BouncyCastle without X25519/EdDSA.
+        // Replace with full provider before any SSH connections.
+        Security.removeProvider(BouncyCastleProvider.PROVIDER_NAME)
+        Security.insertProviderAt(BouncyCastleProvider(), 1)
+
         appContainer = AppContainer(this)
     }
 
