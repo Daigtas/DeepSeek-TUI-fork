@@ -113,6 +113,9 @@ class SshTunnelManager(private val context: Context) {
             }
 
             val client = SSHClient()
+            // Increase timeouts for slow connections
+            client.connectTimeout = 15000
+            client.timeout = 15000
 
             // Custom host key verifier: check known_hosts, prompt user for unknown
             val hostVerifier = createHostKeyVerifier(config.host)
@@ -128,61 +131,81 @@ class SshTunnelManager(private val context: Context) {
                 return@withContext Result.failure(e)
             }
 
-            // Try private key auth first, fall back to password
+            // ── Authentication ────────────────────────────────────────
+            var authenticated = false
+
+            // Try private key auth first
             val keyBytes = keyStore.getSshKeyBytes()
             if (keyBytes != null) {
+                log("Attempting private key authentication...")
                 val tmpKeyFile = File(context.cacheDir, "deepseek_ssh_key_tmp")
                 tmpKeyFile.writeBytes(keyBytes)
                 tmpKeyFile.deleteOnExit()
 
                 try {
-                    client.authPublickey(config.user, client.loadKeys(tmpKeyFile.absolutePath))
-                    log("Authenticated with private key")
+                    val keys = client.loadKeys(tmpKeyFile.absolutePath)
+                    log("Loaded key from PEM file")
+                    client.authPublickey(config.user, keys)
+                    log("✓ Authenticated with private key")
+                    authenticated = true
                 } catch (e: Exception) {
-                    log("Key auth failed: ${e.message}")
-                    if (!config.password.isNullOrBlank()) {
-                        log("Falling back to password auth...")
-                        client.authPassword(config.user, config.password)
-                        log("Authenticated with password")
-                    } else {
-                        throw e
-                    }
+                    log("Key auth failed: ${e.message?.take(120)}")
                 }
-            } else if (!config.password.isNullOrBlank()) {
-                client.authPassword(config.user, config.password)
-                log("Authenticated with password")
-            } else {
-                _state.value = TunnelState.ERROR
-                _errorMessage.value = "No SSH key or password configured"
-                log("ERROR: No authentication method available")
-                client.close()
-                return@withContext Result.failure(IllegalStateException("No auth method"))
             }
 
-            // Execute post-login commands
-            log("Running post-login commands...")
-            for ((i, cmd) in config.postLoginCommands.withIndex()) {
-                val session = client.startSession()
+            // Fall back to password auth
+            if (!authenticated && !config.password.isNullOrBlank()) {
+                log("Attempting password authentication...")
                 try {
-                    log("  [$i] $cmd")
-                    val exec = session.exec(cmd)
-                    exec.join(10, TimeUnit.SECONDS)
-                    val exitCode = exec.exitStatus
-                    if (exitCode != null && exitCode != 0) {
-                        val errStream = exec.errorStream
-                        val errText = errStream?.bufferedReader()?.readText() ?: ""
-                        log("  [$i] FAILED (exit=$exitCode): $errText")
+                    client.authPassword(config.user, config.password)
+                    log("✓ Authenticated with password")
+                    authenticated = true
+                } catch (e: Exception) {
+                    log("Password auth failed: ${e.message?.take(120)}")
+                }
+            }
+
+            if (!authenticated) {
+                _state.value = TunnelState.ERROR
+                val msg = when {
+                    keyBytes == null && config.password.isNullOrBlank() ->
+                        "No SSH key or password configured"
+                    keyBytes != null && config.password.isNullOrBlank() ->
+                        "Private key authentication failed"
+                    keyBytes == null ->
+                        "Password authentication failed"
+                    else -> "All authentication methods failed"
+                }
+                _errorMessage.value = msg
+                log("ERROR: $msg")
+                client.close()
+                return@withContext Result.failure(IllegalStateException(msg))
+            }
+
+            // ── Post-login commands (non-fatal) ─────────────────────────
+            val commands = config.postLoginCommands.filter { it.isNotBlank() }
+            if (commands.isNotEmpty()) {
+                log("Running post-login commands...")
+                for ((i, cmd) in commands.withIndex()) {
+                    val session = client.startSession()
+                    try {
+                        log("  [$i] $cmd")
+                        val exec = session.exec(cmd)
+                        exec.join(5, TimeUnit.SECONDS)
+                        val exitCode = exec.exitStatus
+                        if (exitCode != null && exitCode != 0) {
+                            val errText = exec.errorStream?.bufferedReader()?.readText()?.take(200) ?: ""
+                            log("  [$i] WARNING (exit=$exitCode): $errText")
+                            // Non-fatal — continue anyway
+                        } else {
+                            log("  [$i] OK")
+                        }
+                    } catch (e: Exception) {
+                        log("  [$i] WARNING: ${e.message?.take(100)}")
+                        // Non-fatal
+                    } finally {
                         session.close()
-                        _state.value = TunnelState.ERROR
-                        _errorMessage.value = "Post-login command failed: $cmd (exit=$exitCode)"
-                        client.close()
-                        return@withContext Result.failure(
-                            IllegalStateException("Post-login command failed: $cmd (exit=$exitCode)")
-                        )
                     }
-                    log("  [$i] OK")
-                } finally {
-                    session.close()
                 }
             }
 

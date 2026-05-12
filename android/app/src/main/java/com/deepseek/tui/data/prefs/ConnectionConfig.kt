@@ -9,10 +9,7 @@ data class ConnectionConfig(
     val port: Int = 8484,
     val user: String = "root",
     val password: String? = null,
-    val postLoginCommands: List<String> = listOf(
-        "su boottify",
-        "cd /var/www"
-    ),
+    val postLoginCommands: List<String> = emptyList(),
     val remotePort: Int = 8787,
     val localPort: Int = 18787,
     val healthCheckIntervalSec: Int = 15,
