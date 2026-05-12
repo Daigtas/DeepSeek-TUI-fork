@@ -585,6 +585,8 @@ pub struct BracketedPasteBuffer {
     burst_buffer: Vec<u8>,
     /// How many consecutive reads had bytes flowing (for burst end detection).
     burst_read_count: u32,
+    /// Escape-only reads since last content byte (for menu-paste detection).
+    escape_only_reads: u32,
 }
 
 impl Default for BracketedPasteBuffer {
@@ -593,10 +595,11 @@ impl Default for BracketedPasteBuffer {
             buffer: Vec::new(),
             paste_active: false,
             bracketed_supported: true,
-            burst_threshold: 30,
+            burst_threshold: 20,  // lower threshold catches menu-paste chunks
             burst_active: false,
             burst_buffer: Vec::new(),
             burst_read_count: 0,
+            escape_only_reads: 0,
         }
     }
 }
@@ -700,64 +703,98 @@ impl BracketedPasteBuffer {
     pub fn feed_bytes(&mut self, bytes: &[u8]) -> Vec<UiEvent> {
         // ── Burst paste detection (fallback for terminals without bracketed paste) ──
         // Terminals like PuTTY, screen, tmux (without paste support) don't emit
-        // \e[200~ / \e[201~ sentinels. When the user pastes, all bytes arrive in
-        // a single read() burst. We detect this and treat the batch as paste content.
+        // \e[200~ / \e[201~ sentinels. We detect paste via:
+        //   1. Large burst in one read (rapid paste)
+        //   2. Content after escape-only reads (right-click menu paste)
+        //   3. Multi-chunk accumulation (long paste split across reads)
         if !self.bracketed_supported && !self.paste_active {
+            // Count content bytes vs escape bytes in this read
+            let content_byte_count = bytes.iter().filter(|&&b| b != 0x1b).count();
+            let has_only_escapes = content_byte_count == 0 && !bytes.is_empty();
+
             if bytes.len() >= self.burst_threshold {
-                // Large burst detected — treat as paste content
+                // ── Case 1: Large burst detected ──
                 self.burst_active = true;
                 self.burst_read_count = 0;
-                // Collect only printable/content bytes, skip escape sequences
-                let mut content_bytes = Vec::with_capacity(bytes.len());
+                self.escape_only_reads = 0;
+                self.burst_buffer.clear();
+
+                // Collect content bytes, skip escape sequences
                 let mut i = 0;
                 while i < bytes.len() {
                     if bytes[i] == 0x1b {
                         i = skip_escape_sequence(bytes, i);
                     } else if bytes[i] == b'\r' {
-                        content_bytes.push(b'\n'); // normalize CR → LF
+                        self.burst_buffer.push(b'\n');
                         i += 1;
                     } else {
-                        content_bytes.push(bytes[i]);
+                        self.burst_buffer.push(bytes[i]);
                         i += 1;
                     }
                 }
-                if !content_bytes.is_empty() {
-                    let detected_type = PasteContentType::detect_bytes(&content_bytes);
+                if !self.burst_buffer.is_empty() {
+                    let detected_type = PasteContentType::detect_bytes(&self.burst_buffer);
                     let content = match &detected_type {
-                        PasteContentType::Image { .. } => base64_encode(&content_bytes),
-                        _ => String::from_utf8_lossy(&content_bytes).into_owned(),
+                        PasteContentType::Image { .. } => base64_encode(&self.burst_buffer),
+                        _ => String::from_utf8_lossy(&self.burst_buffer).into_owned(),
                     };
                     let raw_bytes = match &detected_type {
-                        PasteContentType::Image { .. } => Some(content_bytes),
-                        _ => None,
+                        PasteContentType::Image { .. } => Some(std::mem::take(&mut self.burst_buffer)),
+                        _ => { self.burst_buffer.clear(); None }
                     };
                     return vec![UiEvent::PasteContent { content, raw_bytes, detected_type }];
                 }
-            } else if self.burst_active && bytes.is_empty() {
-                // Burst ended — no more bytes in this read
-                self.burst_active = false;
-                if let Some(ev) = self.finish_burst() {
-                    return vec![ev];
-                }
-            } else if self.burst_active && bytes.len() < self.burst_threshold {
-                // Smaller follow-up read during burst — accumulate and continue
-                self.burst_read_count += 1;
-                if self.burst_read_count > 2 {
-                    // Several small reads since last burst — treat burst as complete
-                    self.burst_active = false;
-                    if let Some(ev) = self.finish_burst() {
-                        return vec![ev];
-                    }
-                }
-                // Otherwise, collect these bytes too
+            } else if has_only_escapes {
+                // ── Case 2: Track escape-only reads (menu interaction) ──
+                self.escape_only_reads += 1;
+            } else if self.escape_only_reads > 2 && content_byte_count > 0 {
+                // ── Case 3: Content after menu dismissal → treat as paste ──
+                // After several escape-only reads (menu opened/closed), any
+                // content-heavy read is likely a paste operation.
+                self.burst_active = true;
+                self.escape_only_reads = 0;
+                self.burst_buffer.clear();
                 for &b in bytes {
                     if b == b'\r' {
                         self.burst_buffer.push(b'\n');
-                    } else {
+                    } else if b != 0x1b {
                         self.burst_buffer.push(b);
                     }
                 }
-                return Vec::new();
+                if !self.burst_buffer.is_empty() {
+                    let detected_type = PasteContentType::detect_bytes(&self.burst_buffer);
+                    let content = match &detected_type {
+                        PasteContentType::Image { .. } => base64_encode(&self.burst_buffer),
+                        _ => String::from_utf8_lossy(&self.burst_buffer).into_owned(),
+                    };
+                    let raw_bytes = match &detected_type {
+                        PasteContentType::Image { .. } => Some(std::mem::take(&mut self.burst_buffer)),
+                        _ => { self.burst_buffer.clear(); None }
+                    };
+                    return vec![UiEvent::PasteContent { content, raw_bytes, detected_type }];
+                }
+            } else if content_byte_count > 0 {
+                // Reset escape counter when we see content during normal typing
+                self.escape_only_reads = 0;
+                if self.burst_active && bytes.is_empty() {
+                    // Empty read ends burst
+                    self.burst_active = false;
+                    self.escape_only_reads = 0;
+                    if let Some(ev) = self.finish_burst() {
+                        return vec![ev];
+                    }
+                } else if self.burst_active && content_byte_count < self.burst_threshold {
+                    // ── Case 4: Continue accumulating multi-chunk paste ──
+                    self.burst_read_count += 1;
+                    for &b in bytes {
+                        if b == b'\r' {
+                            self.burst_buffer.push(b'\n');
+                        } else if b != 0x1b {
+                            self.burst_buffer.push(b);
+                        }
+                    }
+                    return Vec::new();
+                }
             }
         }
 
@@ -844,6 +881,7 @@ impl BracketedPasteBuffer {
         self.burst_active = false;
         self.burst_buffer.clear();
         self.burst_read_count = 0;
+        self.escape_only_reads = 0;
     }
 
     /// Current buffered content (useful for preview).
