@@ -1,0 +1,17 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">DeepSeek TUI</string>
+    <string name="connect">Connect</string>
+    <string name="disconnect">Disconnect</string>
+    <string name="connecting">Connecting…</string>
+    <string name="reconnecting">Reconnecting…</string>
+    <string name="connected">Connected</string>
+    <string name="disconnected">Disconnected</string>
+    <string name="error_auth_failed">Authentication failed</string>
+    <string name="error_host_unreachable">Host unreachable</string>
+    <string name="error_daemon_not_running">Daemon not running</string>
+    <string name="start_daemon">Start Daemon</string>
+    <string name="ssh_tunnel_notification_channel">SSH Tunnel</string>
+    <string name="ssh_tunnel_notification_title">DeepSeek SSH Tunnel</string>
+    <string name="ssh_tunnel_notification_text">Connected to boottify.com</string>
+</resources>

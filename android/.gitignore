@@ -1,0 +1,19 @@
+# Build outputs
+/build/
+/app/build/
+*.apk
+*.aab
+*.ap_
+
+# Gradle
+.gradle/
+gradle/wrapper/gradle-wrapper.jar
+!gradle/wrapper/gradle-wrapper.properties
+
+# IDE
+.idea/
+*.iml
+.kotlin/
+
+# Local
+local.properties

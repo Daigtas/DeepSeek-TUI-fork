@@ -1,0 +1,19 @@
+<?xml version="1.0" encoding="utf-8"?>
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="108dp"
+    android:height="108dp"
+    android:viewportWidth="108"
+    android:viewportHeight="108">
+    <!-- Background circle -->
+    <path
+        android:fillColor="#0D1117"
+        android:pathData="M54,54m-54,0a54,54 0,1 1,108 0a54,54 0,1 1,-108 0" />
+    <!-- "D" letterform -->
+    <path
+        android:fillColor="#4FC3F7"
+        android:pathData="M38,28L38,80L58,80C66.8,80 74,72.8 74,64L74,44C74,35.2 66.8,28 58,28L38,28ZM46,36L58,36C62.4,36 66,39.6 66,44L66,64C66,68.4 62.4,72 58,72L46,72L46,36Z" />
+    <!-- Terminal cursor blink -->
+    <path
+        android:fillColor="#4FC3F7"
+        android:pathData="M44,44L56,44L56,50L44,50Z" />
+</vector>
