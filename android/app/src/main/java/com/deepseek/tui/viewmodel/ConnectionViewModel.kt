@@ -16,7 +16,10 @@ data class ConnectionUiState(
     val reconnectCount: Int = 0,
     val host: String = "boottify.com",
     val hasSshKey: Boolean = false,
-    val keyFingerprint: String? = null
+    val keyFingerprint: String? = null,
+    val logMessages: List<String> = emptyList(),
+    val pendingHostKey: SshTunnelManager.PendingHostKey? = null,
+    val config: ConnectionConfig = ConnectionConfig()
 )
 
 class ConnectionViewModel(application: Application) : AndroidViewModel(application) {
@@ -30,7 +33,6 @@ class ConnectionViewModel(application: Application) : AndroidViewModel(applicati
     val uiState: StateFlow<ConnectionUiState> = _uiState.asStateFlow()
 
     init {
-        // Observe tunnel state
         viewModelScope.launch {
             tunnelManager.state.collect { state ->
                 _uiState.update { it.copy(state = state) }
@@ -51,20 +53,40 @@ class ConnectionViewModel(application: Application) : AndroidViewModel(applicati
                 _uiState.update { it.copy(reconnectCount = count) }
             }
         }
+        viewModelScope.launch {
+            tunnelManager.logMessages.collect { msgs ->
+                _uiState.update { it.copy(logMessages = msgs) }
+            }
+        }
+        viewModelScope.launch {
+            tunnelManager.pendingHostKey.collect { key ->
+                _uiState.update { it.copy(pendingHostKey = key) }
+            }
+        }
 
-        // Load config and key status
         refreshKeyStatus()
+        refreshConfig()
     }
 
     fun connect() {
-        viewModelScope.launch {
-            val config = configRepo.loadConfig()
-            tunnelManager.connect()
-        }
+        viewModelScope.launch { tunnelManager.connect() }
     }
 
     fun disconnect() {
         tunnelManager.disconnect()
+    }
+
+    fun acceptHostKey() {
+        tunnelManager.acceptHostKey()
+    }
+
+    fun rejectHostKey() {
+        tunnelManager.rejectHostKey()
+    }
+
+    fun saveConfig(config: ConnectionConfig) {
+        configRepo.saveConfig(config)
+        refreshConfig()
     }
 
     fun refreshKeyStatus() {
@@ -72,9 +94,13 @@ class ConnectionViewModel(application: Application) : AndroidViewModel(applicati
         _uiState.update {
             it.copy(
                 hasSshKey = hasKey,
-                keyFingerprint = keyStore.getPublicKeyFingerprint(),
-                host = configRepo.loadConfig().host
+                keyFingerprint = keyStore.getPublicKeyFingerprint()
             )
         }
+    }
+
+    private fun refreshConfig() {
+        val config = configRepo.loadConfig()
+        _uiState.update { it.copy(host = config.host, config = config) }
     }
 }

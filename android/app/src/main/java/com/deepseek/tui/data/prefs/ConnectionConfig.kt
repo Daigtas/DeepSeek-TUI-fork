@@ -6,8 +6,9 @@ package com.deepseek.tui.data.prefs
  */
 data class ConnectionConfig(
     val host: String = "boottify.com",
-    val port: Int = 22,
+    val port: Int = 8484,
     val user: String = "root",
+    val password: String? = null,
     val postLoginCommands: List<String> = listOf(
         "su boottify",
         "cd /var/www"
@@ -16,7 +17,7 @@ data class ConnectionConfig(
     val localPort: Int = 18787,
     val healthCheckIntervalSec: Int = 15,
     val reconnectMaxBackoffSec: Int = 30,
-    val useDirectHttps: Boolean = false,  // bypass SSH tunnel, use deepseek.boottify.com directly
+    val useDirectHttps: Boolean = false,
     val directHttpsUrl: String = "https://deepseek.boottify.com",
     val daemonAutoStart: Boolean = true
 )

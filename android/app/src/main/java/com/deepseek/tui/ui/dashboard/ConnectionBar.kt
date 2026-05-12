@@ -33,6 +33,7 @@ fun ConnectionBar(
             SshTunnelManager.TunnelState.CONNECTING -> StatusYellow
             SshTunnelManager.TunnelState.ERROR -> StatusRed
             SshTunnelManager.TunnelState.DISCONNECTED -> StatusRed
+            SshTunnelManager.TunnelState.HOST_KEY_UNKNOWN -> StatusYellow
         },
         label = "dotColor"
     )
@@ -42,6 +43,7 @@ fun ConnectionBar(
         SshTunnelManager.TunnelState.CONNECTING -> "Connecting…"
         SshTunnelManager.TunnelState.ERROR -> "Error"
         SshTunnelManager.TunnelState.DISCONNECTED -> "Disconnected"
+        SshTunnelManager.TunnelState.HOST_KEY_UNKNOWN -> "Verify Host Key"
     }
 
     Row(

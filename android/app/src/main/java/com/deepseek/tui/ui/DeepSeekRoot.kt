@@ -1,27 +1,30 @@
 package com.deepseek.tui.ui
 
-import android.net.Uri
 import android.widget.Toast
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.background
 import androidx.compose.foundation.gestures.detectHorizontalDragGestures
 import androidx.compose.foundation.layout.*
+import androidx.compose.foundation.lazy.LazyColumn
+import androidx.compose.foundation.lazy.items
 import androidx.compose.material.icons.Icons
-import androidx.compose.material.icons.filled.Chat
-import androidx.compose.material.icons.filled.Dashboard
-import androidx.compose.material.icons.filled.Settings
+import androidx.compose.material.icons.filled.*
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.text.font.FontFamily
+import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
+import androidx.compose.ui.unit.sp
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.ViewModelProvider
 import androidx.lifecycle.viewmodel.compose.viewModel
 import com.deepseek.tui.DeepSeekApp
+import com.deepseek.tui.connection.SshTunnelManager
 import com.deepseek.tui.ui.chat.ChatScreen
 import com.deepseek.tui.ui.dashboard.DashboardScreen
 import com.deepseek.tui.ui.navigation.NavigationDrawer
@@ -32,23 +35,19 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 
-/**
- * Root composable — hosts the full split-pane layout with
- * navigation drawer, dashboard, chat, and settings.
- */
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
 fun DeepSeekRoot() {
     val context = LocalContext.current
     val app = context.applicationContext as DeepSeekApp
+    val coroutineScope = rememberCoroutineScope()
+    val snackbarHostState = remember { SnackbarHostState() }
 
-    // ViewModel factory
     class ViewModelFactory(val creator: () -> ViewModel) : ViewModelProvider.Factory {
         @Suppress("UNCHECKED_CAST")
         override fun <T : ViewModel> create(modelClass: Class<T>): T = creator() as T
     }
 
-    // ViewModels
     val connectionViewModel: ConnectionViewModel = viewModel(
         factory = ViewModelFactory { ConnectionViewModel(app) }
     )
@@ -63,92 +62,101 @@ fun DeepSeekRoot() {
     val dashboardState by dashboardViewModel.uiState.collectAsState()
     val chatState by chatViewModel.uiState.collectAsState()
 
-    // UI state
     var drawerOpen by remember { mutableStateOf(false) }
-    var selectedScreen by remember { mutableStateOf("chat") } // "chat", "dashboard", "settings"
+    var selectedScreen by remember { mutableStateOf("chat") }
     var fontSize by remember { mutableFloatStateOf(14f) }
-    var paneRatio by remember { mutableFloatStateOf(0.4f) } // 40% dashboard / 60% chat
-    var showClearDataDialog by remember { mutableStateOf(false) }
+    var paneRatio by remember { mutableFloatStateOf(0.4f) }
 
-    val snackbarHostState = remember { SnackbarHostState() }
-    val scope = rememberCoroutineScope()
-
-    // SSH key import file picker
+    // SSH key import launcher
     val keyImportLauncher = rememberLauncherForActivityResult(
         contract = ActivityResultContracts.OpenDocument()
-    ) { uri: Uri? ->
-        if (uri == null) return@rememberLauncherForActivityResult
-        scope.launch {
-            try {
-                val bytes = withContext(Dispatchers.IO) {
-                    context.contentResolver.openInputStream(uri)?.use { it.readBytes() }
+    ) { uri ->
+        uri?.let {
+            coroutineScope.launch {
+                try {
+                    val bytes = withContext(Dispatchers.IO) {
+                        context.contentResolver.openInputStream(it)?.readBytes()
+                    }
+                    if (bytes != null) {
+                        app.appContainer.keyStoreManager.importSshKey(bytes)
+                        connectionViewModel.refreshKeyStatus()
+                        snackbarHostState.showSnackbar("SSH key imported")
+                    }
+                } catch (e: Exception) {
+                    snackbarHostState.showSnackbar("Import failed: ${e.message}")
                 }
-                if (bytes == null || bytes.isEmpty()) {
-                    Toast.makeText(context, "Failed to read key file", Toast.LENGTH_SHORT).show()
-                    return@launch
-                }
-                app.appContainer.keyStoreManager.importSshKey(bytes)
-                connectionViewModel.refreshKeyStatus()
-                Toast.makeText(context, "SSH key imported successfully", Toast.LENGTH_SHORT).show()
-            } catch (e: Exception) {
-                Toast.makeText(
-                    context,
-                    "Import failed: ${e.message}",
-                    Toast.LENGTH_SHORT
-                ).show()
             }
         }
     }
 
-    // Clear data confirmation dialog
-    if (showClearDataDialog) {
+    // Clear data dialog
+    var showClearDialog by remember { mutableStateOf(false) }
+    if (showClearDialog) {
         AlertDialog(
-            onDismissRequest = { showClearDataDialog = false },
-            title = { Text("Clear All Local Data") },
+            onDismissRequest = { showClearDialog = false },
+            title = { Text("Clear All Data?") },
+            text = { Text("This will remove all messages, cached data, and connection settings. This cannot be undone.") },
+            confirmButton = {
+                TextButton(onClick = {
+                    showClearDialog = false
+                    coroutineScope.launch {
+                        app.appContainer.clearAllData()
+                        connectionViewModel.refreshKeyStatus()
+                        chatViewModel.newConversation()
+                        snackbarHostState.showSnackbar("Data cleared")
+                    }
+                }) { Text("Clear", color = StatusRed) }
+            },
+            dismissButton = {
+                TextButton(onClick = { showClearDialog = false }) { Text("Cancel") }
+            }
+        )
+    }
+
+    // Host key acceptance dialog
+    val pendingHostKey = connectionState.pendingHostKey
+    if (pendingHostKey != null) {
+        AlertDialog(
+            onDismissRequest = { connectionViewModel.rejectHostKey() },
+            title = { Text("Unknown Host Key") },
             text = {
-                Text(
-                    "This will delete all messages, agents, SSH keys, and connection settings. " +
-                    "This action cannot be undone. Continue?"
-                )
+                Column {
+                    Text("The authenticity of host '${pendingHostKey.host}' can't be established.")
+                    Spacer(modifier = Modifier.height(8.dp))
+                    Text("Key type: ${pendingHostKey.keyType}", fontWeight = FontWeight.Bold)
+                    Text(
+                        text = "Fingerprint: ${pendingHostKey.fingerprint}",
+                        fontFamily = FontFamily.Monospace,
+                        fontSize = 11.sp
+                    )
+                    Spacer(modifier = Modifier.height(8.dp))
+                    Text(
+                        "Are you sure you want to continue connecting?",
+                        color = StatusYellow
+                    )
+                }
             },
             confirmButton = {
-                TextButton(
-                    onClick = {
-                        showClearDataDialog = false
-                        scope.launch {
-                            try {
-                                app.appContainer.clearAllData()
-                                connectionViewModel.refreshKeyStatus()
-                                chatViewModel.newConversation()
-                                snackbarHostState.showSnackbar("Data cleared")
-                            } catch (e: Exception) {
-                                Toast.makeText(
-                                    context,
-                                    "Clear failed: ${e.message}",
-                                    Toast.LENGTH_SHORT
-                                ).show()
-                            }
-                        }
-                    },
-                    colors = ButtonDefaults.textButtonColors(contentColor = StatusRed)
-                ) {
-                    Text("Clear All Data")
+                TextButton(onClick = { connectionViewModel.acceptHostKey() }) {
+                    Text("Accept", color = StatusGreen)
                 }
             },
             dismissButton = {
-                TextButton(onClick = { showClearDataDialog = false }) {
-                    Text("Cancel")
+                TextButton(onClick = { connectionViewModel.rejectHostKey() }) {
+                    Text("Reject", color = StatusRed)
                 }
             }
         )
     }
 
-    // Start polling when connected
+    // Auto-connect WebSocket when SSH connects
     LaunchedEffect(connectionState.state) {
-        if (connectionState.state == com.deepseek.tui.connection.SshTunnelManager.TunnelState.CONNECTED) {
+        if (connectionState.state == SshTunnelManager.TunnelState.CONNECTED) {
             dashboardViewModel.startPolling()
+            chatViewModel.connectWebSocket()
         } else {
             dashboardViewModel.stopPolling()
+            chatViewModel.disconnectWebSocket()
         }
     }
 
@@ -170,19 +178,14 @@ fun DeepSeekRoot() {
             snackbarHost = { SnackbarHost(snackbarHostState) },
             containerColor = Background,
             bottomBar = {
-                // Bottom nav bar
-                NavigationBar(
-                    containerColor = Surface,
-                    contentColor = OnSurface
-                ) {
+                NavigationBar(containerColor = Surface, contentColor = OnSurface) {
                     NavigationBarItem(
                         selected = selectedScreen == "chat",
                         onClick = { selectedScreen = "chat" },
                         icon = { Icon(Icons.Filled.Chat, "Chat") },
                         label = { Text("Chat") },
                         colors = NavigationBarItemDefaults.colors(
-                            selectedIconColor = Primary,
-                            selectedTextColor = Primary,
+                            selectedIconColor = Primary, selectedTextColor = Primary,
                             indicatorColor = SurfaceVariant
                         )
                     )
@@ -192,8 +195,7 @@ fun DeepSeekRoot() {
                         icon = { Icon(Icons.Filled.Dashboard, "Dashboard") },
                         label = { Text("Dashboard") },
                         colors = NavigationBarItemDefaults.colors(
-                            selectedIconColor = Primary,
-                            selectedTextColor = Primary,
+                            selectedIconColor = Primary, selectedTextColor = Primary,
                             indicatorColor = SurfaceVariant
                         )
                     )
@@ -203,8 +205,7 @@ fun DeepSeekRoot() {
                         icon = { Icon(Icons.Filled.Settings, "Settings") },
                         label = { Text("Settings") },
                         colors = NavigationBarItemDefaults.colors(
-                            selectedIconColor = Primary,
-                            selectedTextColor = Primary,
+                            selectedIconColor = Primary, selectedTextColor = Primary,
                             indicatorColor = SurfaceVariant
                         )
                     )
@@ -223,7 +224,6 @@ fun DeepSeekRoot() {
             ) {
                 when (selectedScreen) {
                     "dashboard" -> {
-                        // Full-screen dashboard
                         DashboardScreen(
                             connectionState = connectionState,
                             dashboardState = dashboardState,
@@ -235,91 +235,111 @@ fun DeepSeekRoot() {
                         SettingsScreen(
                             fontSize = fontSize,
                             paneRatio = paneRatio,
+                            connectionConfig = connectionState.config,
                             onFontSizeChanged = { fontSize = it },
                             onPaneRatioChanged = { paneRatio = it },
+                            onConnectionConfigChanged = { config ->
+                                connectionViewModel.saveConfig(config)
+                            },
                             onImportKey = { keyImportLauncher.launch(arrayOf("*/*")) },
-                            onClearData = { showClearDataDialog = true },
-                            modifier = Modifier.fillMaxSize()
+                            onClearData = { showClearDialog = true }
                         )
                     }
                     else -> {
-                        // Split-pane layout (chat + optional dashboard)
-                        if (connectionState.state == com.deepseek.tui.connection.SshTunnelManager.TunnelState.CONNECTED) {
-                            // Connected: show split
+                        if (connectionState.state == SshTunnelManager.TunnelState.CONNECTED) {
                             Column(modifier = Modifier.fillMaxSize()) {
-                                // Dashboard (top pane)
                                 DashboardScreen(
                                     connectionState = connectionState,
                                     dashboardState = dashboardState,
                                     onDisconnect = { connectionViewModel.disconnect() },
-                                    modifier = Modifier
-                                        .fillMaxWidth()
-                                        .fillMaxHeight(paneRatio)
+                                    modifier = Modifier.fillMaxWidth().fillMaxHeight(paneRatio)
                                 )
-
                                 HorizontalDivider(color = Divider, thickness = 2.dp)
-
-                                // Chat (bottom pane)
                                 ChatScreen(
                                     chatState = chatState,
                                     onInputChanged = { chatViewModel.onInputChanged(it) },
                                     onSend = { chatViewModel.sendMessage() },
                                     onNewConversation = { chatViewModel.newConversation() },
-                                    modifier = Modifier
-                                        .fillMaxWidth()
-                                        .weight(1f)
+                                    modifier = Modifier.fillMaxWidth().weight(1f)
                                 )
                             }
                         } else {
-                            // Disconnected: show connect button + status
-                            Box(
-                                modifier = Modifier.fillMaxSize(),
-                                contentAlignment = androidx.compose.ui.Alignment.Center
+                            // Disconnected — show connect UI + log
+                            Column(
+                                modifier = Modifier.fillMaxSize().padding(16.dp),
+                                horizontalAlignment = Alignment.CenterHorizontally
                             ) {
-                                Column(
-                                    horizontalAlignment = androidx.compose.ui.Alignment.CenterHorizontally
+                                Spacer(modifier = Modifier.height(32.dp))
+                                Text(
+                                    text = "DeepSeek TUI",
+                                    style = MaterialTheme.typography.headlineLarge,
+                                    color = Primary,
+                                    fontWeight = FontWeight.Bold
+                                )
+                                Text(
+                                    text = "${connectionState.config.host}:${connectionState.config.port}",
+                                    style = MaterialTheme.typography.bodyMedium,
+                                    color = OnSurface.copy(alpha = 0.6f)
+                                )
+                                Spacer(modifier = Modifier.height(24.dp))
+
+                                if (!connectionState.hasSshKey && connectionState.config.password.isNullOrBlank()) {
+                                    Text(
+                                        text = "Import SSH key or set password to connect",
+                                        style = MaterialTheme.typography.bodySmall,
+                                        color = StatusRed
+                                    )
+                                    Spacer(modifier = Modifier.height(12.dp))
+                                }
+
+                                Button(
+                                    onClick = { connectionViewModel.connect() },
+                                    enabled = connectionState.state != SshTunnelManager.TunnelState.CONNECTING
+                                        && connectionState.state != SshTunnelManager.TunnelState.HOST_KEY_UNKNOWN
                                 ) {
-                                    Text(
-                                        text = "DeepSeek TUI",
-                                        style = MaterialTheme.typography.headlineMedium,
-                                        color = Primary
-                                    )
-                                    Spacer(modifier = Modifier.height(8.dp))
-                                    Text(
-                                        text = connectionState.host,
-                                        style = MaterialTheme.typography.bodyMedium,
-                                        color = OnSurface.copy(alpha = 0.6f)
-                                    )
-                                    Spacer(modifier = Modifier.height(24.dp))
+                                    Text(when (connectionState.state) {
+                                        SshTunnelManager.TunnelState.CONNECTING -> "Connecting…"
+                                        SshTunnelManager.TunnelState.HOST_KEY_UNKNOWN -> "Awaiting host key…"
+                                        else -> "Connect"
+                                    })
+                                }
 
-                                    if (!connectionState.hasSshKey) {
-                                        Text(
-                                            text = "Import SSH key to connect",
-                                            style = MaterialTheme.typography.bodySmall,
-                                            color = StatusRed
-                                        )
-                                        Spacer(modifier = Modifier.height(12.dp))
-                                    }
+                                if (connectionState.errorMessage != null) {
+                                    Spacer(modifier = Modifier.height(12.dp))
+                                    Text(
+                                        text = connectionState.errorMessage!!,
+                                        style = MaterialTheme.typography.bodySmall,
+                                        color = MaterialTheme.colorScheme.error
+                                    )
+                                }
 
-                                    Button(
-                                        onClick = { connectionViewModel.connect() },
-                                        enabled = connectionState.state != com.deepseek.tui.connection.SshTunnelManager.TunnelState.CONNECTING
+                                // Connection log
+                                if (connectionState.logMessages.isNotEmpty()) {
+                                    Spacer(modifier = Modifier.height(16.dp))
+                                    Card(
+                                        modifier = Modifier.fillMaxWidth().weight(1f),
+                                        colors = CardDefaults.cardColors(containerColor = SurfaceVariant)
                                     ) {
-                                        Text(
-                                            when (connectionState.state) {
-                                                com.deepseek.tui.connection.SshTunnelManager.TunnelState.CONNECTING -> "Connecting…"
-                                                else -> "Connect"
+                                        Column(modifier = Modifier.padding(12.dp)) {
+                                            Text(
+                                                text = "Connection Log",
+                                                style = MaterialTheme.typography.labelLarge,
+                                                color = Primary,
+                                                fontWeight = FontWeight.Bold
+                                            )
+                                            Spacer(modifier = Modifier.height(4.dp))
+                                            LazyColumn {
+                                                items(connectionState.logMessages) { msg ->
+                                                    Text(
+                                                        text = msg,
+                                                        fontFamily = FontFamily.Monospace,
+                                                        fontSize = 11.sp,
+                                                        color = OnSurface.copy(alpha = 0.8f),
+                                                        modifier = Modifier.padding(vertical = 1.dp)
+                                                    )
+                                                }
                                             }
-                                        )
-                                    }
-
-                                    if (connectionState.errorMessage != null) {
-                                        Spacer(modifier = Modifier.height(12.dp))
-                                        Text(
-                                            text = connectionState.errorMessage!!,
-                                            style = MaterialTheme.typography.bodySmall,
-                                            color = MaterialTheme.colorScheme.error
-                                        )
+                                        }
                                     }
                                 }
                             }
