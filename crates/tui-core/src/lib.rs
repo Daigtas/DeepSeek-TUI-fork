@@ -305,6 +305,8 @@ pub enum UiEvent {
     CompletionTrigger,
     /// Ctrl+Tab pressed — cycle between Plan / Agent / YOLO modes.
     CtrlTabPressed,
+    /// User input sent while agent is executing tools (mid-execution pushback).
+    UserPushback(String),
     /// Backspace in the input buffer (for path completion tracking).
     BackspacePressed,
     /// Cycle to next path completion candidate.
@@ -351,6 +353,8 @@ pub enum UiEffect {
     AttachFile(String),
     /// Toggle between Plan / Agent / YOLO modes (triggered by Ctrl+Tab).
     ToggleMode,
+    /// Inject user input into the running agent's context for mid-execution rethinking.
+    PushbackDraft(String),
     /// Show slash command completion suggestions.
     ShowSlashSuggestions(Vec<String>),
     /// Show the slash command popup menu with structured data.
@@ -1403,6 +1407,9 @@ pub struct UiState {
     /// Saved session checkpoints (most recent first).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub checkpoints: Vec<Checkpoint>,
+    /// Pending user input to inject into the agent's execution stream.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pending_pushback: Option<String>,
 }
 
 impl Default for UiState {
@@ -1423,6 +1430,7 @@ impl Default for UiState {
             context_budget: ContextBudget::default(),
             terminal_caps: TerminalCaps::default(),
             checkpoints: Vec::new(),
+            pending_pushback: None,
         }
     }
 }
@@ -1573,6 +1581,23 @@ impl UiState {
                         ];
                     }
                 }
+                // ── Mid-execution pushback detection ────────────────────────
+                if self.active_tool.is_some() || self.pending_tasks > 0 {
+                    let pushback = trimmed.to_string();
+                    self.pending_pushback = Some(pushback.clone());
+                    self.status_line = format!(
+                        "pushback: {}…",
+                        &pushback[..pushback.len().min(50)]
+                    );
+                    self.input_buffer.clear();
+                    self.path_completer = None;
+                    return smallvec![
+                        UiEffect::Render,
+                        UiEffect::PushbackDraft(pushback),
+                        UiEffect::EmitStatusLine(self.status_line.clone()),
+                    ];
+                }
+                // ── Normal prompt submission ──────────────────────────────────
                 self.pending_tasks = self.pending_tasks.saturating_add(1);
                 self.status_line = "prompt submitted".into();
                 self.input_buffer.clear();
@@ -1594,20 +1619,30 @@ impl UiState {
             UiEvent::ToolStarted(name) => {
                 self.active_tool = Some(name.clone());
                 self.status_line = format!("tool running: {name}");
-                smallvec![
+                let mut effects = smallvec![
                     UiEffect::Render,
                     UiEffect::EmitStatusLine(self.status_line.clone()),
-                ]
+                ];
+                // Flush any pending pushback so agent sees it before tool results
+                if let Some(pushback) = self.pending_pushback.take() {
+                    effects.push(UiEffect::PushbackDraft(pushback));
+                }
+                effects
             }
             UiEvent::ToolFinished(name) => {
                 self.active_tool = None;
                 self.pending_tasks = self.pending_tasks.saturating_sub(1);
                 self.status_line = format!("tool finished: {name}");
-                smallvec![
+                let mut effects = smallvec![
                     UiEffect::Render,
                     UiEffect::PersistCheckpoint,
                     UiEffect::EmitStatusLine(self.status_line.clone()),
-                ]
+                ];
+                // Flush any pending pushback so the agent rethinks before next tool
+                if let Some(pushback) = self.pending_pushback.take() {
+                    effects.push(UiEffect::PushbackDraft(pushback));
+                }
+                effects
             }
             UiEvent::JobQueued(_) => {
                 self.active_jobs = self.active_jobs.saturating_add(1);
@@ -1959,6 +1994,24 @@ impl UiState {
                         ];
                     }
                 }
+                // ── Mid-execution pushback detection ────────────────────────
+                // If a tool is running or tasks are pending, inject the text
+                // into the agent's context instead of starting a new prompt.
+                if self.active_tool.is_some() || self.pending_tasks > 0 {
+                    let pushback = prompt.trim().to_string();
+                    self.pending_pushback = Some(pushback.clone());
+                    self.status_line = format!(
+                        "pushback: {}…",
+                        &pushback[..pushback.len().min(50)]
+                    );
+                    self.path_completer = None;
+                    return smallvec![
+                        UiEffect::Render,
+                        UiEffect::PushbackDraft(pushback),
+                        UiEffect::EmitStatusLine(self.status_line.clone()),
+                    ];
+                }
+                // ── Normal prompt submission ──────────────────────────────────
                 self.pending_tasks = self.pending_tasks.saturating_add(1);
                 self.status_line = "prompt submitted".into();
                 self.path_completer = None;
@@ -2006,6 +2059,15 @@ impl UiState {
                 smallvec![
                     UiEffect::Render,
                     UiEffect::AgentStatusChanged { id: id.clone(), status: "errored".into() },
+                    UiEffect::EmitStatusLine(self.status_line.clone()),
+                ]
+            }
+            UiEvent::UserPushback(ref pushback) => {
+                self.pending_pushback = Some(pushback.clone());
+                self.status_line = format!("pushback: {}…", &pushback[..pushback.len().min(50)]);
+                smallvec![
+                    UiEffect::Render,
+                    UiEffect::PushbackDraft(pushback.clone()),
                     UiEffect::EmitStatusLine(self.status_line.clone()),
                 ]
             }
@@ -2965,6 +3027,78 @@ mod tests {
         let effects = state.reduce(UiEvent::EnterPressed);
         assert!(effects.iter().any(|e| matches!(e, UiEffect::ExecuteSlashCommand(SlashCommand::Help))));
         assert!(state.input_buffer.is_empty());
+    }
+
+    #[test]
+    fn enter_during_tool_execution_becomes_pushback() {
+        let mut state = UiState::default();
+        state.active_tool = Some("read_file".into());
+        state.input_buffer = "also check error handling".into();
+        let effects = state.reduce(UiEvent::EnterPressed);
+        // Should NOT increment pending_tasks (this is pushback, not new prompt)
+        assert_eq!(state.pending_tasks, 0);
+        assert!(state.input_buffer.is_empty());
+        assert!(state.pending_pushback.is_some());
+        assert_eq!(state.pending_pushback.as_deref().unwrap(), "also check error handling");
+        assert!(effects.iter().any(|e| matches!(e, UiEffect::PushbackDraft(p) if p == "also check error handling")));
+    }
+
+    #[test]
+    fn enter_with_pending_tasks_becomes_pushback() {
+        let mut state = UiState::default();
+        state.pending_tasks = 2;  // agent has queued tasks
+        state.input_buffer = "stop using sed, use edit_file instead".into();
+        let effects = state.reduce(UiEvent::EnterPressed);
+        // Should NOT increment pending_tasks
+        assert_eq!(state.pending_tasks, 2);
+        assert!(state.input_buffer.is_empty());
+        assert!(state.pending_pushback.is_some());
+        assert!(effects.iter().any(|e| matches!(e, UiEffect::PushbackDraft(p) if p.contains("edit_file"))));
+    }
+
+    #[test]
+    fn tool_finished_flushes_pending_pushback() {
+        let mut state = UiState::default();
+        state.active_tool = Some("read_file".into());
+        state.pending_tasks = 1;
+        state.pending_pushback = Some("check the error handling too".into());
+        let effects = state.reduce(UiEvent::ToolFinished("read_file".into()));
+        assert!(state.active_tool.is_none());
+        assert!(state.pending_pushback.is_none());
+        assert_eq!(state.pending_tasks, 0);
+        assert!(effects.iter().any(|e| matches!(e, UiEffect::PushbackDraft(p) if p == "check the error handling too")));
+    }
+
+    #[test]
+    fn tool_started_flushes_pending_pushback() {
+        let mut state = UiState::default();
+        state.pending_pushback = Some("use grep instead".into());
+        let effects = state.reduce(UiEvent::ToolStarted("write_file".into()));
+        assert!(state.active_tool.is_some());
+        assert!(state.pending_pushback.is_none());
+        assert!(effects.iter().any(|e| matches!(e, UiEffect::PushbackDraft(p) if p == "use grep instead")));
+    }
+
+    #[test]
+    fn multiple_pushbacks_overwrite() {
+        let mut state = UiState::default();
+        state.active_tool = Some("read_file".into());
+        state.input_buffer = "first thought".into();
+        state.reduce(UiEvent::EnterPressed);
+        assert_eq!(state.pending_pushback.as_deref().unwrap(), "first thought");
+        state.input_buffer = "actually, second thought".into();
+        let effects = state.reduce(UiEvent::EnterPressed);
+        // Second pushback overwrites first
+        assert_eq!(state.pending_pushback.as_deref().unwrap(), "actually, second thought");
+        assert!(effects.iter().any(|e| matches!(e, UiEffect::PushbackDraft(p) if p == "actually, second thought")));
+    }
+
+    #[test]
+    fn user_pushback_event_works() {
+        let mut state = UiState::default();
+        let effects = state.reduce(UiEvent::UserPushback("fix all bugs".into()));
+        assert_eq!(state.pending_pushback.as_deref().unwrap(), "fix all bugs");
+        assert!(effects.iter().any(|e| matches!(e, UiEffect::PushbackDraft(p) if p == "fix all bugs")));
     }
 
     #[test]
