@@ -27,8 +27,12 @@ import com.deepseek.tui.DeepSeekApp
 import com.deepseek.tui.connection.SshTunnelManager
 import com.deepseek.tui.ui.chat.ChatScreen
 import com.deepseek.tui.ui.dashboard.DashboardScreen
+import com.deepseek.tui.ui.hive.HiveScreen
 import com.deepseek.tui.ui.navigation.NavigationDrawer
+import com.deepseek.tui.ui.sessions.SessionsScreen
+import com.deepseek.tui.ui.settings.AppSettings
 import com.deepseek.tui.ui.settings.SettingsScreen
+import com.deepseek.tui.ui.swarm.SwarmScreen
 import com.deepseek.tui.ui.theme.*
 import com.deepseek.tui.viewmodel.*
 import kotlinx.coroutines.Dispatchers
@@ -57,15 +61,29 @@ fun DeepSeekRoot() {
     val chatViewModel: ChatViewModel = viewModel(
         factory = ViewModelFactory { ChatViewModel(app) }
     )
+    val swarmViewModel: SwarmViewModel = viewModel(
+        factory = ViewModelFactory { SwarmViewModel(app) }
+    )
+    val hiveViewModel: HiveViewModel = viewModel(
+        factory = ViewModelFactory { HiveViewModel(app) }
+    )
+    val sessionsViewModel: SessionsViewModel = viewModel(
+        factory = ViewModelFactory { SessionsViewModel(app) }
+    )
 
     val connectionState by connectionViewModel.uiState.collectAsState()
     val dashboardState by dashboardViewModel.uiState.collectAsState()
     val chatState by chatViewModel.uiState.collectAsState()
+    val swarmState by swarmViewModel.uiState.collectAsState()
+    val hiveState by hiveViewModel.uiState.collectAsState()
 
     var drawerOpen by remember { mutableStateOf(false) }
     var selectedScreen by remember { mutableStateOf("chat") }
     var fontSize by remember { mutableFloatStateOf(14f) }
     var paneRatio by remember { mutableFloatStateOf(0.4f) }
+    var appSettings by remember { mutableStateOf(AppSettings()) }
+
+    val sessionsState by sessionsViewModel.uiState.collectAsState()
 
     // SSH key import launcher
     val keyImportLauncher = rememberLauncherForActivityResult(
@@ -160,6 +178,15 @@ fun DeepSeekRoot() {
         }
     }
 
+    // Load swarm/hive data when those screens are selected
+    LaunchedEffect(selectedScreen) {
+        if (selectedScreen == "swarm") {
+            swarmViewModel.refreshAgents()
+        } else if (selectedScreen == "hive") {
+            hiveViewModel.refreshSnapshot()
+        }
+    }
+
     ModalNavigationDrawer(
         drawerState = rememberDrawerState(if (drawerOpen) DrawerValue.Open else DrawerValue.Closed),
         gesturesEnabled = drawerOpen,
@@ -200,6 +227,36 @@ fun DeepSeekRoot() {
                         )
                     )
                     NavigationBarItem(
+                        selected = selectedScreen == "swarm",
+                        onClick = { selectedScreen = "swarm" },
+                        icon = { Icon(Icons.Filled.Group, "Swarm") },
+                        label = { Text("Swarm") },
+                        colors = NavigationBarItemDefaults.colors(
+                            selectedIconColor = Primary, selectedTextColor = Primary,
+                            indicatorColor = SurfaceVariant
+                        )
+                    )
+                    NavigationBarItem(
+                        selected = selectedScreen == "hive",
+                        onClick = { selectedScreen = "hive" },
+                        icon = { Icon(Icons.Filled.Storage, "Hive") },
+                        label = { Text("Hive") },
+                        colors = NavigationBarItemDefaults.colors(
+                            selectedIconColor = Primary, selectedTextColor = Primary,
+                            indicatorColor = SurfaceVariant
+                        )
+                    )
+                    NavigationBarItem(
+                        selected = selectedScreen == "sessions",
+                        onClick = { selectedScreen = "sessions" },
+                        icon = { Icon(Icons.Filled.History, "Sessions") },
+                        label = { Text("Sessions") },
+                        colors = NavigationBarItemDefaults.colors(
+                            selectedIconColor = Primary, selectedTextColor = Primary,
+                            indicatorColor = SurfaceVariant
+                        )
+                    )
+                    NavigationBarItem(
                         selected = selectedScreen == "settings",
                         onClick = { selectedScreen = "settings" },
                         icon = { Icon(Icons.Filled.Settings, "Settings") },
@@ -231,18 +288,52 @@ fun DeepSeekRoot() {
                             modifier = Modifier.fillMaxSize()
                         )
                     }
+                    "swarm" -> {
+                        SwarmScreen(
+                            state = swarmState,
+                            onRefresh = { swarmViewModel.refreshAgents() },
+                            onSpawn = { role, name, prompt ->
+                                swarmViewModel.spawnAgent(role, name, prompt)
+                            },
+                            onClearMessage = { swarmViewModel.clearMessage() },
+                            modifier = Modifier.fillMaxSize()
+                        )
+                    }
+                    "hive" -> {
+                        HiveScreen(
+                            state = hiveState,
+                            onRefresh = { hiveViewModel.refreshSnapshot() },
+                            onQuery = { key -> hiveViewModel.queryByKey(key) },
+                            onInject = { key, value -> hiveViewModel.injectEntry(key, value) },
+                            onFilterChange = { prefix -> hiveViewModel.setFilterPrefix(prefix) },
+                            onClearMessages = { hiveViewModel.clearMessages() },
+                            modifier = Modifier.fillMaxSize()
+                        )
+                    }
                     "settings" -> {
                         SettingsScreen(
                             fontSize = fontSize,
                             paneRatio = paneRatio,
                             connectionConfig = connectionState.config,
+                            appSettings = appSettings,
+                            daemonConnected = connectionState.state == SshTunnelManager.TunnelState.CONNECTED,
                             onFontSizeChanged = { fontSize = it },
                             onPaneRatioChanged = { paneRatio = it },
-                            onConnectionConfigChanged = { config ->
-                                connectionViewModel.saveConfig(config)
-                            },
+                            onConnectionConfigChanged = { config -> connectionViewModel.saveConfig(config) },
+                            onAppSettingsChanged = { appSettings = it },
                             onImportKey = { keyImportLauncher.launch(arrayOf("*/*")) },
-                            onClearData = { showClearDialog = true }
+                            onClearData = { showClearDialog = true },
+                            onDetach = { connectionViewModel.detachDaemon() },
+                            onAttach = { connectionViewModel.attachDaemon() },
+                            onCheckpoint = { connectionViewModel.saveCheckpoint() }
+                        )
+                    }
+                    "sessions" -> {
+                        SessionsScreen(
+                            state = sessionsState,
+                            onRefresh = { sessionsViewModel.loadSessions() },
+                            onDelete = { sessionsViewModel.deleteSession(it) },
+                            onExport = { sessionsViewModel.exportSession(it) }
                         )
                     }
                     else -> {

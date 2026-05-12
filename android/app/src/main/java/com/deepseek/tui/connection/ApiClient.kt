@@ -63,6 +63,19 @@ class ApiClient {
         }
     }
 
+    suspend fun delete(path: String): Result<String> {
+        return try {
+            val request = Request.Builder()
+                .url("$baseUrl$path")
+                .delete()
+                .build()
+            val response = okHttpClient.newCall(request).execute()
+            Result.success(response.body?.string() ?: "")
+        } catch (e: IOException) {
+            Result.failure(e)
+        }
+    }
+
     // ── WebSocket ───────────────────────────────────────────────────────
 
     fun newWebSocket(
@@ -75,9 +88,11 @@ class ApiClient {
         return okHttpClient.newWebSocket(request, listener)
     }
 
-    // ── Daemon-specific endpoints ───────────────────────────────────────
+    // ── Health ───────────────────────────────────────────────────────────
 
     suspend fun healthCheck(): Result<String> = get("/healthz")
+
+    // ── Daemon status / lifecycle ────────────────────────────────────────
 
     suspend fun daemonStatus(): Result<String> = get("/daemon/status")
 
@@ -85,9 +100,130 @@ class ApiClient {
 
     suspend fun daemonProgress(): Result<String> = get("/daemon/progress")
 
+    /** POST /daemon/detach — detach from the daemon (empty body). */
+    suspend fun daemonDetach(): Result<String> =
+        post("/daemon/detach", "{}")
+
+    /** POST /daemon/attach — attach to the daemon (empty body). */
+    suspend fun daemonAttach(): Result<String> =
+        post("/daemon/attach", "{}")
+
+    /** POST /daemon/checkpoint — save a hive checkpoint. */
+    suspend fun daemonCheckpoint(): Result<String> =
+        post("/daemon/checkpoint", "{}")
+
+    // ── Swarm ────────────────────────────────────────────────────────────
+
     suspend fun swarmAgents(): Result<String> = get("/swarm/agents")
 
+    /** POST /swarm/spawn — launch a new swarm agent. */
+    suspend fun swarmSpawn(role: String, name: String, prompt: String): Result<String> {
+        val body = """{"role":"$role","name":"$name","prompt":"$prompt"}"""
+        return post("/swarm/spawn", body)
+    }
+
+    /** POST /swarm/spawn — raw JSON body variant. */
+    suspend fun swarmSpawnRaw(jsonBody: String): Result<String> =
+        post("/swarm/spawn", jsonBody)
+
+    // ── Hive ─────────────────────────────────────────────────────────────
+
     suspend fun hiveSummary(): Result<String> = get("/hive/summary")
+
+    /** GET /hive/query/{key} — look up a hive entry by key. */
+    suspend fun hiveQuery(key: String): Result<String> =
+        get("/hive/query/${key}")
+
+    /** POST /hive/inject — insert or update a hive entry (value is JSON-encoded). */
+    suspend fun hiveInject(key: String, value: String): Result<String> {
+        val escapedValue = value
+            .replace("\\", "\\\\")
+            .replace("\"", "\\\"")
+            .replace("\n", "\\n")
+            .replace("\r", "\\r")
+            .replace("\t", "\\t")
+        val body = """{"key":"$key","value":"$escapedValue"}"""
+        return post("/hive/inject", body)
+    }
+
+    /** POST /hive/inject — raw JSON body variant. */
+    suspend fun hiveInjectRaw(jsonBody: String): Result<String> =
+        post("/hive/inject", jsonBody)
+
+    /** GET /hive/snapshot — full hive snapshot. */
+    suspend fun hiveSnapshot(): Result<String> = get("/hive/snapshot")
+
+    // ── Sessions ─────────────────────────────────────────────────────────
+
+    /** GET /sessions — list all sessions. */
+    suspend fun sessionList(): Result<String> = get("/sessions")
+
+    /** GET /sessions/{id} — read one session. */
+    suspend fun sessionRead(id: String): Result<String> = get("/sessions/$id")
+
+    /** DELETE /sessions/{id} — delete a session. */
+    suspend fun sessionDelete(id: String): Result<String> = delete("/sessions/$id")
+
+    /** POST /sessions/{id}/export — export a session archive. */
+    suspend fun sessionExport(id: String): Result<String> =
+        post("/sessions/$id/export", "{}")
+
+    /** POST /sessions/import — import a session archive. */
+    suspend fun sessionImport(archivePath: String, overwrite: Boolean = false): Result<String> {
+        val body = """{"archive_path":"$archivePath","overwrite":$overwrite}"""
+        return post("/sessions/import", body)
+    }
+
+    // ── App config ───────────────────────────────────────────────────────
+
+    /** POST /app with method=get — read a config value. */
+    suspend fun appGet(key: String): Result<String> {
+        val body = """{"method":"get","key":"$key"}"""
+        return post("/app", body)
+    }
+
+    /** POST /app with method=set — write a config value. */
+    suspend fun appSet(key: String, value: String): Result<String> {
+        val body = """{"method":"set","key":"$key","value":"$value"}"""
+        return post("/app", body)
+    }
+
+    /** POST /app with method=unset — remove a config key. */
+    suspend fun appUnset(key: String): Result<String> {
+        val body = """{"method":"unset","key":"$key"}"""
+        return post("/app", body)
+    }
+
+    /** POST /app with method=list — list all config values. */
+    suspend fun appList(): Result<String> =
+        post("/app", """{"method":"list"}""")
+
+    // ── Generic endpoint helpers ─────────────────────────────────────────
+
+    /** GET /jobs — list active jobs. */
+    suspend fun getJobs(): Result<String> = get("/jobs")
+
+    /** POST /thread — create or interact with a thread. */
+    suspend fun postThread(jsonBody: String): Result<String> =
+        post("/thread", jsonBody)
+
+    /** POST /app — raw app endpoint (capabilities, config ops, models, etc.). */
+    suspend fun postApp(jsonBody: String): Result<String> =
+        post("/app", jsonBody)
+
+    /** POST /prompt — send a prompt to the daemon. */
+    suspend fun postPrompt(jsonBody: String): Result<String> =
+        post("/prompt", jsonBody)
+
+    /** POST /tool — invoke a tool through the daemon. */
+    suspend fun postTool(jsonBody: String): Result<String> =
+        post("/tool", jsonBody)
+
+    /** POST /mcp/startup — trigger MCP startup sequence. */
+    suspend fun mcpStartup(): Result<String> =
+        post("/mcp/startup", "{}")
+
+    // ── Lifecycle ────────────────────────────────────────────────────────
 
     fun close() {
         okHttpClient.dispatcher.executorService.shutdown()

@@ -34,6 +34,9 @@ fun NavigationDrawer(
     val items = listOf(
         DrawerItem("chat", "Chat") { Icon(Icons.Filled.Chat, null, modifier = Modifier.size(24.dp)) },
         DrawerItem("dashboard", "Dashboard") { Icon(Icons.Filled.Dashboard, null, modifier = Modifier.size(24.dp)) },
+        DrawerItem("swarm", "Swarm") { Icon(Icons.Filled.Group, null, modifier = Modifier.size(24.dp)) },
+        DrawerItem("hive", "Hive") { Icon(Icons.Filled.Storage, null, modifier = Modifier.size(24.dp)) },
+        DrawerItem("sessions", "Sessions") { Icon(Icons.Filled.History, null, modifier = Modifier.size(24.dp)) },
         DrawerItem("settings", "Settings") { Icon(Icons.Filled.Settings, null, modifier = Modifier.size(24.dp)) },
     )
 

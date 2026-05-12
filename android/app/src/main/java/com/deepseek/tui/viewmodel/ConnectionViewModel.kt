@@ -28,75 +28,36 @@ class ConnectionViewModel(application: Application) : AndroidViewModel(applicati
     private val tunnelManager = app.appContainer.sshTunnelManager
     private val keyStore = app.appContainer.keyStoreManager
     private val configRepo = app.appContainer.configRepository
+    private val apiClient = app.appContainer.apiClient
 
     private val _uiState = MutableStateFlow(ConnectionUiState())
     val uiState: StateFlow<ConnectionUiState> = _uiState.asStateFlow()
 
     init {
-        viewModelScope.launch {
-            tunnelManager.state.collect { state ->
-                _uiState.update { it.copy(state = state) }
-            }
-        }
-        viewModelScope.launch {
-            tunnelManager.errorMessage.collect { error ->
-                _uiState.update { it.copy(errorMessage = error) }
-            }
-        }
-        viewModelScope.launch {
-            tunnelManager.latencyMs.collect { latency ->
-                _uiState.update { it.copy(latencyMs = latency) }
-            }
-        }
-        viewModelScope.launch {
-            tunnelManager.reconnectCount.collect { count ->
-                _uiState.update { it.copy(reconnectCount = count) }
-            }
-        }
-        viewModelScope.launch {
-            tunnelManager.logMessages.collect { msgs ->
-                _uiState.update { it.copy(logMessages = msgs) }
-            }
-        }
-        viewModelScope.launch {
-            tunnelManager.pendingHostKey.collect { key ->
-                _uiState.update { it.copy(pendingHostKey = key) }
-            }
-        }
-
+        viewModelScope.launch { tunnelManager.state.collect { _uiState.update { s -> s.copy(state = it) } } }
+        viewModelScope.launch { tunnelManager.errorMessage.collect { _uiState.update { s -> s.copy(errorMessage = it) } } }
+        viewModelScope.launch { tunnelManager.latencyMs.collect { _uiState.update { s -> s.copy(latencyMs = it) } } }
+        viewModelScope.launch { tunnelManager.reconnectCount.collect { _uiState.update { s -> s.copy(reconnectCount = it) } } }
+        viewModelScope.launch { tunnelManager.logMessages.collect { _uiState.update { s -> s.copy(logMessages = it) } } }
+        viewModelScope.launch { tunnelManager.pendingHostKey.collect { _uiState.update { s -> s.copy(pendingHostKey = it) } } }
         refreshKeyStatus()
         refreshConfig()
     }
 
-    fun connect() {
-        viewModelScope.launch { tunnelManager.connect() }
-    }
+    fun connect() { viewModelScope.launch { tunnelManager.connect() } }
+    fun disconnect() { tunnelManager.disconnect() }
+    fun acceptHostKey() { tunnelManager.acceptHostKey() }
+    fun rejectHostKey() { tunnelManager.rejectHostKey() }
 
-    fun disconnect() {
-        tunnelManager.disconnect()
-    }
+    fun detachDaemon() { viewModelScope.launch { apiClient.daemonDetach() } }
+    fun attachDaemon() { viewModelScope.launch { apiClient.daemonAttach() } }
+    fun saveCheckpoint() { viewModelScope.launch { apiClient.daemonCheckpoint() } }
 
-    fun acceptHostKey() {
-        tunnelManager.acceptHostKey()
-    }
-
-    fun rejectHostKey() {
-        tunnelManager.rejectHostKey()
-    }
-
-    fun saveConfig(config: ConnectionConfig) {
-        configRepo.saveConfig(config)
-        refreshConfig()
-    }
+    fun saveConfig(config: ConnectionConfig) { configRepo.saveConfig(config); refreshConfig() }
 
     fun refreshKeyStatus() {
         val hasKey = keyStore.hasKey() || keyStore.getSshKeyBytes() != null
-        _uiState.update {
-            it.copy(
-                hasSshKey = hasKey,
-                keyFingerprint = keyStore.getPublicKeyFingerprint()
-            )
-        }
+        _uiState.update { it.copy(hasSshKey = hasKey, keyFingerprint = keyStore.getPublicKeyFingerprint()) }
     }
 
     private fun refreshConfig() {
