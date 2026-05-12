@@ -3,7 +3,6 @@ package com.deepseek.tui.ui
 import android.widget.Toast
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
-import androidx.compose.foundation.background
 import androidx.compose.foundation.gestures.detectHorizontalDragGestures
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
@@ -27,12 +26,8 @@ import com.deepseek.tui.DeepSeekApp
 import com.deepseek.tui.connection.SshTunnelManager
 import com.deepseek.tui.ui.chat.ChatScreen
 import com.deepseek.tui.ui.dashboard.DashboardScreen
-import com.deepseek.tui.ui.hive.HiveScreen
 import com.deepseek.tui.ui.navigation.NavigationDrawer
-import com.deepseek.tui.ui.sessions.SessionsScreen
-import com.deepseek.tui.ui.settings.AppSettings
 import com.deepseek.tui.ui.settings.SettingsScreen
-import com.deepseek.tui.ui.swarm.SwarmScreen
 import com.deepseek.tui.ui.theme.*
 import com.deepseek.tui.viewmodel.*
 import kotlinx.coroutines.Dispatchers
@@ -52,49 +47,25 @@ fun DeepSeekRoot() {
         override fun <T : ViewModel> create(modelClass: Class<T>): T = creator() as T
     }
 
-    val connectionViewModel: ConnectionViewModel = viewModel(
-        factory = ViewModelFactory { ConnectionViewModel(app) }
-    )
-    val dashboardViewModel: DashboardViewModel = viewModel(
-        factory = ViewModelFactory { DashboardViewModel(app) }
-    )
-    val chatViewModel: ChatViewModel = viewModel(
-        factory = ViewModelFactory { ChatViewModel(app) }
-    )
-    val swarmViewModel: SwarmViewModel = viewModel(
-        factory = ViewModelFactory { SwarmViewModel(app) }
-    )
-    val hiveViewModel: HiveViewModel = viewModel(
-        factory = ViewModelFactory { HiveViewModel(app) }
-    )
-    val sessionsViewModel: SessionsViewModel = viewModel(
-        factory = ViewModelFactory { SessionsViewModel(app) }
-    )
+    val connectionViewModel: ConnectionViewModel = viewModel(factory = ViewModelFactory { ConnectionViewModel(app) })
+    val dashboardViewModel: DashboardViewModel = viewModel(factory = ViewModelFactory { DashboardViewModel(app) })
+    val chatViewModel: ChatViewModel = viewModel(factory = ViewModelFactory { ChatViewModel(app) })
 
     val connectionState by connectionViewModel.uiState.collectAsState()
     val dashboardState by dashboardViewModel.uiState.collectAsState()
     val chatState by chatViewModel.uiState.collectAsState()
-    val swarmState by swarmViewModel.uiState.collectAsState()
-    val hiveState by hiveViewModel.uiState.collectAsState()
 
     var drawerOpen by remember { mutableStateOf(false) }
     var selectedScreen by remember { mutableStateOf("chat") }
     var fontSize by remember { mutableFloatStateOf(14f) }
     var paneRatio by remember { mutableFloatStateOf(0.4f) }
-    var appSettings by remember { mutableStateOf(AppSettings()) }
-
-    val sessionsState by sessionsViewModel.uiState.collectAsState()
 
     // SSH key import launcher
-    val keyImportLauncher = rememberLauncherForActivityResult(
-        contract = ActivityResultContracts.OpenDocument()
-    ) { uri ->
+    val keyImportLauncher = rememberLauncherForActivityResult(contract = ActivityResultContracts.OpenDocument()) { uri ->
         uri?.let {
             coroutineScope.launch {
                 try {
-                    val bytes = withContext(Dispatchers.IO) {
-                        context.contentResolver.openInputStream(it)?.readBytes()
-                    }
+                    val bytes = withContext(Dispatchers.IO) { context.contentResolver.openInputStream(it)?.readBytes() }
                     if (bytes != null) {
                         app.appContainer.keyStoreManager.importSshKey(bytes)
                         connectionViewModel.refreshKeyStatus()
@@ -113,7 +84,7 @@ fun DeepSeekRoot() {
         AlertDialog(
             onDismissRequest = { showClearDialog = false },
             title = { Text("Clear All Data?") },
-            text = { Text("This will remove all messages, cached data, and connection settings. This cannot be undone.") },
+            text = { Text("This will remove all messages, cached data, and settings.") },
             confirmButton = {
                 TextButton(onClick = {
                     showClearDialog = false
@@ -125,13 +96,11 @@ fun DeepSeekRoot() {
                     }
                 }) { Text("Clear", color = StatusRed) }
             },
-            dismissButton = {
-                TextButton(onClick = { showClearDialog = false }) { Text("Cancel") }
-            }
+            dismissButton = { TextButton(onClick = { showClearDialog = false }) { Text("Cancel") } }
         )
     }
 
-    // Host key acceptance dialog
+    // Host key dialog
     val pendingHostKey = connectionState.pendingHostKey
     if (pendingHostKey != null) {
         AlertDialog(
@@ -140,34 +109,18 @@ fun DeepSeekRoot() {
             text = {
                 Column {
                     Text("The authenticity of host '${pendingHostKey.host}' can't be established.")
-                    Spacer(modifier = Modifier.height(8.dp))
+                    Spacer(Modifier.height(8.dp))
                     Text("Key type: ${pendingHostKey.keyType}", fontWeight = FontWeight.Bold)
-                    Text(
-                        text = "Fingerprint: ${pendingHostKey.fingerprint}",
-                        fontFamily = FontFamily.Monospace,
-                        fontSize = 11.sp
-                    )
-                    Spacer(modifier = Modifier.height(8.dp))
-                    Text(
-                        "Are you sure you want to continue connecting?",
-                        color = StatusYellow
-                    )
+                    Text("Fingerprint: ${pendingHostKey.fingerprint}", fontFamily = FontFamily.Monospace, fontSize = 11.sp)
+                    Spacer(Modifier.height(8.dp))
+                    Text("Accept and continue?", color = StatusYellow)
                 }
             },
-            confirmButton = {
-                TextButton(onClick = { connectionViewModel.acceptHostKey() }) {
-                    Text("Accept", color = StatusGreen)
-                }
-            },
-            dismissButton = {
-                TextButton(onClick = { connectionViewModel.rejectHostKey() }) {
-                    Text("Reject", color = StatusRed)
-                }
-            }
+            confirmButton = { TextButton(onClick = { connectionViewModel.acceptHostKey() }) { Text("Accept", color = StatusGreen) } },
+            dismissButton = { TextButton(onClick = { connectionViewModel.rejectHostKey() }) { Text("Reject", color = StatusRed) } }
         )
     }
 
-    // Auto-connect WebSocket when SSH connects
     LaunchedEffect(connectionState.state) {
         if (connectionState.state == SshTunnelManager.TunnelState.CONNECTED) {
             dashboardViewModel.startPolling()
@@ -175,15 +128,6 @@ fun DeepSeekRoot() {
         } else {
             dashboardViewModel.stopPolling()
             chatViewModel.disconnectWebSocket()
-        }
-    }
-
-    // Load swarm/hive data when those screens are selected
-    LaunchedEffect(selectedScreen) {
-        if (selectedScreen == "swarm") {
-            swarmViewModel.refreshAgents()
-        } else if (selectedScreen == "hive") {
-            hiveViewModel.refreshSnapshot()
         }
     }
 
@@ -206,230 +150,59 @@ fun DeepSeekRoot() {
             containerColor = Background,
             bottomBar = {
                 NavigationBar(containerColor = Surface, contentColor = OnSurface) {
-                    NavigationBarItem(
-                        selected = selectedScreen == "chat",
-                        onClick = { selectedScreen = "chat" },
-                        icon = { Icon(Icons.Filled.Chat, "Chat") },
-                        label = { Text("Chat") },
-                        colors = NavigationBarItemDefaults.colors(
-                            selectedIconColor = Primary, selectedTextColor = Primary,
-                            indicatorColor = SurfaceVariant
-                        )
-                    )
-                    NavigationBarItem(
-                        selected = selectedScreen == "dashboard",
-                        onClick = { selectedScreen = "dashboard" },
-                        icon = { Icon(Icons.Filled.Dashboard, "Dashboard") },
-                        label = { Text("Dashboard") },
-                        colors = NavigationBarItemDefaults.colors(
-                            selectedIconColor = Primary, selectedTextColor = Primary,
-                            indicatorColor = SurfaceVariant
-                        )
-                    )
-                    NavigationBarItem(
-                        selected = selectedScreen == "swarm",
-                        onClick = { selectedScreen = "swarm" },
-                        icon = { Icon(Icons.Filled.Group, "Swarm") },
-                        label = { Text("Swarm") },
-                        colors = NavigationBarItemDefaults.colors(
-                            selectedIconColor = Primary, selectedTextColor = Primary,
-                            indicatorColor = SurfaceVariant
-                        )
-                    )
-                    NavigationBarItem(
-                        selected = selectedScreen == "hive",
-                        onClick = { selectedScreen = "hive" },
-                        icon = { Icon(Icons.Filled.Storage, "Hive") },
-                        label = { Text("Hive") },
-                        colors = NavigationBarItemDefaults.colors(
-                            selectedIconColor = Primary, selectedTextColor = Primary,
-                            indicatorColor = SurfaceVariant
-                        )
-                    )
-                    NavigationBarItem(
-                        selected = selectedScreen == "sessions",
-                        onClick = { selectedScreen = "sessions" },
-                        icon = { Icon(Icons.Filled.History, "Sessions") },
-                        label = { Text("Sessions") },
-                        colors = NavigationBarItemDefaults.colors(
-                            selectedIconColor = Primary, selectedTextColor = Primary,
-                            indicatorColor = SurfaceVariant
-                        )
-                    )
-                    NavigationBarItem(
-                        selected = selectedScreen == "settings",
-                        onClick = { selectedScreen = "settings" },
-                        icon = { Icon(Icons.Filled.Settings, "Settings") },
-                        label = { Text("Settings") },
-                        colors = NavigationBarItemDefaults.colors(
-                            selectedIconColor = Primary, selectedTextColor = Primary,
-                            indicatorColor = SurfaceVariant
-                        )
-                    )
+                    NavigationBarItem(selected = selectedScreen == "chat", onClick = { selectedScreen = "chat" },
+                        icon = { Icon(Icons.Filled.Chat, "Chat") }, label = { Text("Chat") },
+                        colors = navColors())
+                    NavigationBarItem(selected = selectedScreen == "dashboard", onClick = { selectedScreen = "dashboard" },
+                        icon = { Icon(Icons.Filled.Dashboard, "Dashboard") }, label = { Text("Dashboard") },
+                        colors = navColors())
+                    NavigationBarItem(selected = selectedScreen == "settings", onClick = { selectedScreen = "settings" },
+                        icon = { Icon(Icons.Filled.Settings, "Settings") }, label = { Text("Settings") },
+                        colors = navColors())
                 }
             }
         ) { padding ->
-            Box(
-                modifier = Modifier
-                    .fillMaxSize()
-                    .padding(padding)
-                    .pointerInput(Unit) {
-                        detectHorizontalDragGestures { _, dragAmount ->
-                            if (dragAmount > 50f) drawerOpen = true
-                        }
-                    }
-            ) {
+            Box(Modifier.fillMaxSize().padding(padding).pointerInput(Unit) {
+                detectHorizontalDragGestures { _, dragAmount -> if (dragAmount > 50f) drawerOpen = true }
+            }) {
                 when (selectedScreen) {
-                    "dashboard" -> {
-                        DashboardScreen(
-                            connectionState = connectionState,
-                            dashboardState = dashboardState,
-                            onDisconnect = { connectionViewModel.disconnect() },
-                            modifier = Modifier.fillMaxSize()
-                        )
-                    }
-                    "swarm" -> {
-                        SwarmScreen(
-                            state = swarmState,
-                            onRefresh = { swarmViewModel.refreshAgents() },
-                            onSpawn = { role, name, prompt ->
-                                swarmViewModel.spawnAgent(role, name, prompt)
-                            },
-                            onClearMessage = { swarmViewModel.clearMessage() },
-                            modifier = Modifier.fillMaxSize()
-                        )
-                    }
-                    "hive" -> {
-                        HiveScreen(
-                            state = hiveState,
-                            onRefresh = { hiveViewModel.refreshSnapshot() },
-                            onQuery = { key -> hiveViewModel.queryByKey(key) },
-                            onInject = { key, value -> hiveViewModel.injectEntry(key, value) },
-                            onFilterChange = { prefix -> hiveViewModel.setFilterPrefix(prefix) },
-                            onClearMessages = { hiveViewModel.clearMessages() },
-                            modifier = Modifier.fillMaxSize()
-                        )
-                    }
-                    "settings" -> {
-                        SettingsScreen(
-                            fontSize = fontSize,
-                            paneRatio = paneRatio,
-                            connectionConfig = connectionState.config,
-                            appSettings = appSettings,
-                            daemonConnected = connectionState.state == SshTunnelManager.TunnelState.CONNECTED,
-                            onFontSizeChanged = { fontSize = it },
-                            onPaneRatioChanged = { paneRatio = it },
-                            onConnectionConfigChanged = { config -> connectionViewModel.saveConfig(config) },
-                            onAppSettingsChanged = { appSettings = it },
-                            onImportKey = { keyImportLauncher.launch(arrayOf("*/*")) },
-                            onClearData = { showClearDialog = true },
-                            onDetach = { connectionViewModel.detachDaemon() },
-                            onAttach = { connectionViewModel.attachDaemon() },
-                            onCheckpoint = { connectionViewModel.saveCheckpoint() }
-                        )
-                    }
-                    "sessions" -> {
-                        SessionsScreen(
-                            state = sessionsState,
-                            onRefresh = { sessionsViewModel.loadSessions() },
-                            onDelete = { sessionsViewModel.deleteSession(it) },
-                            onExport = { sessionsViewModel.exportSession(it) }
-                        )
-                    }
+                    "dashboard" -> DashboardScreen(connectionState, dashboardState, { connectionViewModel.disconnect() }, {}, {}, {}, Modifier.fillMaxSize())
+                    "settings" -> SettingsScreen(fontSize, paneRatio, connectionState.config,
+                        onFontSizeChanged = { fontSize = it }, onPaneRatioChanged = { paneRatio = it },
+                        onConnectionConfigChanged = { connectionViewModel.saveConfig(it) },
+                        onImportKey = { keyImportLauncher.launch(arrayOf("*/*")) }, onClearData = { showClearDialog = true })
                     else -> {
                         if (connectionState.state == SshTunnelManager.TunnelState.CONNECTED) {
-                            Column(modifier = Modifier.fillMaxSize()) {
-                                DashboardScreen(
-                                    connectionState = connectionState,
-                                    dashboardState = dashboardState,
-                                    onDisconnect = { connectionViewModel.disconnect() },
-                                    modifier = Modifier.fillMaxWidth().fillMaxHeight(paneRatio)
-                                )
+                            Column(Modifier.fillMaxSize()) {
+                                DashboardScreen(connectionState, dashboardState, { connectionViewModel.disconnect() }, {}, {}, {}, Modifier.fillMaxWidth().fillMaxHeight(paneRatio))
                                 HorizontalDivider(color = Divider, thickness = 2.dp)
-                                ChatScreen(
-                                    chatState = chatState,
-                                    onInputChanged = { chatViewModel.onInputChanged(it) },
-                                    onSend = { chatViewModel.sendMessage() },
-                                    onNewConversation = { chatViewModel.newConversation() },
-                                    modifier = Modifier.fillMaxWidth().weight(1f)
-                                )
+                                ChatScreen(chatState, { chatViewModel.onInputChanged(it) }, { chatViewModel.sendMessage() }, { chatViewModel.newConversation() }, modifier = Modifier.fillMaxWidth().weight(1f))
                             }
                         } else {
-                            // Disconnected — show connect UI + log
-                            Column(
-                                modifier = Modifier.fillMaxSize().padding(16.dp),
-                                horizontalAlignment = Alignment.CenterHorizontally
-                            ) {
-                                Spacer(modifier = Modifier.height(32.dp))
-                                Text(
-                                    text = "DeepSeek TUI",
-                                    style = MaterialTheme.typography.headlineLarge,
-                                    color = Primary,
-                                    fontWeight = FontWeight.Bold
-                                )
-                                Text(
-                                    text = "${connectionState.config.host}:${connectionState.config.port}",
-                                    style = MaterialTheme.typography.bodyMedium,
-                                    color = OnSurface.copy(alpha = 0.6f)
-                                )
-                                Spacer(modifier = Modifier.height(24.dp))
-
+                            Column(Modifier.fillMaxSize().padding(16.dp), horizontalAlignment = Alignment.CenterHorizontally) {
+                                Spacer(Modifier.height(32.dp))
+                                Text("DeepSeek TUI", style = MaterialTheme.typography.headlineLarge, color = Primary, fontWeight = FontWeight.Bold)
+                                Text("${connectionState.config.host}:${connectionState.config.port}", style = MaterialTheme.typography.bodyMedium, color = OnSurface.copy(alpha = 0.6f))
+                                Spacer(Modifier.height(24.dp))
                                 if (!connectionState.hasSshKey && connectionState.config.password.isNullOrBlank()) {
-                                    Text(
-                                        text = "Import SSH key or set password to connect",
-                                        style = MaterialTheme.typography.bodySmall,
-                                        color = StatusRed
-                                    )
-                                    Spacer(modifier = Modifier.height(12.dp))
+                                    Text("Import SSH key or set password to connect", style = MaterialTheme.typography.bodySmall, color = StatusRed)
+                                    Spacer(Modifier.height(12.dp))
                                 }
-
-                                Button(
-                                    onClick = { connectionViewModel.connect() },
-                                    enabled = connectionState.state != SshTunnelManager.TunnelState.CONNECTING
-                                        && connectionState.state != SshTunnelManager.TunnelState.HOST_KEY_UNKNOWN
-                                ) {
-                                    Text(when (connectionState.state) {
-                                        SshTunnelManager.TunnelState.CONNECTING -> "Connecting…"
-                                        SshTunnelManager.TunnelState.HOST_KEY_UNKNOWN -> "Awaiting host key…"
-                                        else -> "Connect"
-                                    })
+                                Button(onClick = { connectionViewModel.connect() },
+                                    enabled = connectionState.state != SshTunnelManager.TunnelState.CONNECTING && connectionState.state != SshTunnelManager.TunnelState.HOST_KEY_UNKNOWN) {
+                                    Text(when (connectionState.state) { SshTunnelManager.TunnelState.CONNECTING -> "Connecting…"; SshTunnelManager.TunnelState.HOST_KEY_UNKNOWN -> "Awaiting host key…"; else -> "Connect" })
                                 }
-
                                 if (connectionState.errorMessage != null) {
-                                    Spacer(modifier = Modifier.height(12.dp))
-                                    Text(
-                                        text = connectionState.errorMessage!!,
-                                        style = MaterialTheme.typography.bodySmall,
-                                        color = MaterialTheme.colorScheme.error
-                                    )
+                                    Spacer(Modifier.height(12.dp))
+                                    Text(connectionState.errorMessage!!, style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.error)
                                 }
-
-                                // Connection log
                                 if (connectionState.logMessages.isNotEmpty()) {
-                                    Spacer(modifier = Modifier.height(16.dp))
-                                    Card(
-                                        modifier = Modifier.fillMaxWidth().weight(1f),
-                                        colors = CardDefaults.cardColors(containerColor = SurfaceVariant)
-                                    ) {
-                                        Column(modifier = Modifier.padding(12.dp)) {
-                                            Text(
-                                                text = "Connection Log",
-                                                style = MaterialTheme.typography.labelLarge,
-                                                color = Primary,
-                                                fontWeight = FontWeight.Bold
-                                            )
-                                            Spacer(modifier = Modifier.height(4.dp))
-                                            LazyColumn {
-                                                items(connectionState.logMessages) { msg ->
-                                                    Text(
-                                                        text = msg,
-                                                        fontFamily = FontFamily.Monospace,
-                                                        fontSize = 11.sp,
-                                                        color = OnSurface.copy(alpha = 0.8f),
-                                                        modifier = Modifier.padding(vertical = 1.dp)
-                                                    )
-                                                }
-                                            }
+                                    Spacer(Modifier.height(16.dp))
+                                    Card(Modifier.fillMaxWidth().weight(1f), colors = CardDefaults.cardColors(containerColor = SurfaceVariant)) {
+                                        Column(Modifier.padding(12.dp)) {
+                                            Text("Connection Log", style = MaterialTheme.typography.labelLarge, color = Primary, fontWeight = FontWeight.Bold)
+                                            Spacer(Modifier.height(4.dp))
+                                            LazyColumn { items(connectionState.logMessages) { msg -> Text(msg, fontFamily = FontFamily.Monospace, fontSize = 11.sp, color = OnSurface.copy(alpha = 0.8f), modifier = Modifier.padding(vertical = 1.dp)) } }
                                         }
                                     }
                                 }
@@ -441,3 +214,6 @@ fun DeepSeekRoot() {
         }
     }
 }
+
+@Composable
+private fun navColors() = NavigationBarItemDefaults.colors(selectedIconColor = Primary, selectedTextColor = Primary, indicatorColor = SurfaceVariant)
