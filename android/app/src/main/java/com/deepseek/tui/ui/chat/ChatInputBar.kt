@@ -20,7 +20,8 @@ fun ChatInputBar(
     isSending: Boolean,
     onInputChanged: (String) -> Unit,
     onSend: () -> Unit,
-    onNewConversation: () -> Unit,
+    onNewConversation: () -> Unit = {},
+    onAttachFile: () -> Unit = {},
     modifier: Modifier = Modifier
 ) {
     Surface(
@@ -34,14 +35,14 @@ fun ChatInputBar(
                 .padding(horizontal = 8.dp, vertical = 6.dp),
             verticalAlignment = Alignment.CenterVertically
         ) {
-            // New conversation button
+            // File attachment button
             IconButton(
-                onClick = onNewConversation,
+                onClick = onAttachFile,
                 modifier = Modifier.size(40.dp)
             ) {
                 Icon(
-                    imageVector = Icons.Default.Add,
-                    contentDescription = "New conversation",
+                    imageVector = Icons.Filled.Add,
+                    contentDescription = "Attach file",
                     tint = OnSurface.copy(alpha = 0.6f),
                     modifier = Modifier.size(22.dp)
                 )

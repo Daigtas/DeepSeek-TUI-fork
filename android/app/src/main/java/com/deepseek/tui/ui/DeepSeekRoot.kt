@@ -65,11 +65,28 @@ fun DeepSeekRoot() {
     var selectedScreen by remember { mutableStateOf("chat") }
     var fontSize by remember { mutableFloatStateOf(14f) }
     var paneRatio by remember { mutableFloatStateOf(0.4f) }
+
+    // AI settings (persisted locally; also sent to server when connected)
+    var appModel by remember { mutableStateOf("deepseek-v4-pro") }
+    var appProvider by remember { mutableStateOf("deepseek") }
+    var appThinking by remember { mutableStateOf("high") }
+    var appAutoMode by remember { mutableStateOf(false) }
+
     val sessionsState by sessionsViewModel.uiState.collectAsState()
     val swarmState by swarmViewModel.uiState.collectAsState()
     val hiveState by hiveViewModel.uiState.collectAsState()
 
     // SSH key import launcher
+    // File attachment picker for chat
+    val chatAttachmentLauncher = rememberLauncherForActivityResult(contract = ActivityResultContracts.OpenDocument()) { uri ->
+        uri?.let {
+            coroutineScope.launch {
+                val path = it.path ?: it.lastPathSegment ?: "file"
+                chatViewModel.onInputChanged(chatState.inputText + " @$path")
+            }
+        }
+    }
+
     val keyImportLauncher = rememberLauncherForActivityResult(contract = ActivityResultContracts.OpenDocument()) { uri ->
         uri?.let {
             coroutineScope.launch {
@@ -191,13 +208,24 @@ fun DeepSeekRoot() {
                     "settings" -> SettingsScreen(fontSize, paneRatio, connectionState.config,
                         onFontSizeChanged = { fontSize = it }, onPaneRatioChanged = { paneRatio = it },
                         onConnectionConfigChanged = { connectionViewModel.saveConfig(it) },
-                        onImportKey = { keyImportLauncher.launch(arrayOf("*/*")) }, onClearData = { showClearDialog = true })
+                        onImportKey = { keyImportLauncher.launch(arrayOf("*/*")) },
+                        onClearData = { showClearDialog = true },
+                        model = appModel, provider = appProvider,
+                        thinkingEffort = appThinking, autoMode = appAutoMode,
+                        onModelChanged = { appModel = it; connectionViewModel.setModel(it) },
+                        onProviderChanged = { appProvider = it; connectionViewModel.setProvider(it) },
+                        onThinkingChanged = { appThinking = it; connectionViewModel.setThinkingEffort(it) },
+                        onAutoModeChanged = { appAutoMode = it; connectionViewModel.setAutoMode(it) },
+                        daemonConnected = connectionState.state == SshTunnelManager.TunnelState.CONNECTED,
+                        onDetach = { connectionViewModel.detachDaemon() },
+                        onAttach = { connectionViewModel.attachDaemon() },
+                        onCheckpoint = { connectionViewModel.saveCheckpoint() })
                     else -> {
                         if (connectionState.state == SshTunnelManager.TunnelState.CONNECTED) {
                             Column(Modifier.fillMaxSize()) {
                                 DashboardScreen(connectionState, dashboardState, { connectionViewModel.disconnect() }, {}, {}, {}, Modifier.fillMaxWidth().fillMaxHeight(paneRatio))
                                 HorizontalDivider(color = Divider, thickness = 2.dp)
-                                ChatScreen(chatState, { chatViewModel.onInputChanged(it) }, { chatViewModel.sendMessage() }, { chatViewModel.newConversation() }, modifier = Modifier.fillMaxWidth().weight(1f))
+                                ChatScreen(chatState, { chatViewModel.onInputChanged(it) }, { chatViewModel.sendMessage() }, { chatViewModel.newConversation() }, onAttachFile = { chatAttachmentLauncher.launch(arrayOf("*/*")) }, modifier = Modifier.fillMaxWidth().weight(1f))
                             }
                         } else {
                             Column(Modifier.fillMaxSize().padding(16.dp), horizontalAlignment = Alignment.CenterHorizontally) {

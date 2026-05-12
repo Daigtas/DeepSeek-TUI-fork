@@ -53,6 +53,20 @@ class ConnectionViewModel(application: Application) : AndroidViewModel(applicati
     fun attachDaemon() { viewModelScope.launch { apiClient.daemonAttach() } }
     fun saveCheckpoint() { viewModelScope.launch { apiClient.daemonCheckpoint() } }
 
+    // ── Server config (POST /app set) ──────────────────────────────────
+    fun setModel(model: String) { sendConfig("model", model) }
+    fun setProvider(prov: String) { sendConfig("provider", prov) }
+    fun setThinkingEffort(effort: String) { sendConfig("thinking_effort", effort) }
+    fun setAutoMode(on: Boolean) { sendConfig("auto_mode", if (on) "true" else "false") }
+    fun setApiKey(key: String) { sendConfig("api_key", key) }
+    fun setBaseUrl(url: String) { sendConfig("base_url", url) }
+
+    private fun sendConfig(key: String, value: String) {
+        viewModelScope.launch {
+            try { apiClient.appSet(key, value) } catch (_: Exception) {}
+        }
+    }
+
     fun saveConfig(config: ConnectionConfig) { configRepo.saveConfig(config); refreshConfig() }
 
     fun refreshKeyStatus() {

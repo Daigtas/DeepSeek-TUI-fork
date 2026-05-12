@@ -17,6 +17,7 @@ fun ChatScreen(
     onInputChanged: (String) -> Unit,
     onSend: () -> Unit,
     onNewConversation: () -> Unit,
+    onAttachFile: () -> Unit = {},
     onRetryMessage: (MessageEntity) -> Unit = {},
     onEditMessage: (MessageEntity) -> Unit = {},
     modifier: Modifier = Modifier
@@ -46,7 +47,8 @@ fun ChatScreen(
             isSending = chatState.isSending,
             onInputChanged = onInputChanged,
             onSend = onSend,
-            onNewConversation = onNewConversation
+            onNewConversation = onNewConversation,
+            onAttachFile = onAttachFile
         )
     }
 }
