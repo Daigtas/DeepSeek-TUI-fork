@@ -3,6 +3,8 @@ package com.deepseek.tui.connection
 import android.content.Context
 import android.util.Base64
 import kotlinx.coroutines.*
+import org.bouncycastle.jce.provider.BouncyCastleProvider
+import java.security.Security
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
@@ -103,6 +105,12 @@ class SshTunnelManager(private val context: Context) {
         try {
             val config = configRepo.loadConfig()
             log("Connecting to ${config.host}:${config.port} as ${config.user}...")
+
+            // Register BouncyCastle for EdDSA/X25519 support (Android doesn't include it)
+            if (Security.getProvider(BouncyCastleProvider.PROVIDER_NAME) == null) {
+                Security.insertProviderAt(BouncyCastleProvider(), 1)
+                log("Registered BouncyCastle security provider")
+            }
 
             val client = SSHClient()
 
