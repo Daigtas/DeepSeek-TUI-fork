@@ -1,0 +1,243 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+/* ── Theme Variables ──────────────────────────────────────────────── */
+:root,
+[data-theme="dark"] {
+  --bg: #0d0d0d;
+  --bg-alt: #151515;
+  --bg-card: #1a1a1a;
+  --bg-hover: #222222;
+  --border: #2a2a2a;
+  --fg: #d4d4d4;
+  --fg-dim: #888888;
+  --fg-faint: #888888;
+  --amber: #e6a817;
+  --amber-light: #f0c040;
+  --amber-dim: #8a6310;
+  --green: #5faf5f;
+  --green-light: #7fc77f;
+  --green-dim: #3a6a3a;
+  --cyan: #5fafaf;
+  --cyan-light: #7fc7c7;
+  --cyan-dim: #3a6a6a;
+  --rose: #d75f5f;
+  --rose-light: #e08080;
+  --rose-dim: #8a3a3a;
+  --scrollbar-thumb: #3a3a3a;
+  --scrollbar-thumb-hover: #555555;
+  --selection-bg: rgba(230, 168, 23, 0.25);
+}
+
+[data-theme="light"] {
+  --bg: #f5f5f5;
+  --bg-alt: #e8e8e8;
+  --bg-card: #ffffff;
+  --bg-hover: #f0f0f0;
+  --border: #d4d4d4;
+  --fg: #1a1a1a;
+  --fg-dim: #555555;
+  --fg-faint: #666666;
+  --amber: #b8860b;
+  --amber-light: #d4a017;
+  --amber-dim: #8a6310;
+  --green: #3a8a3a;
+  --green-light: #4fa84f;
+  --green-dim: #2a6a2a;
+  --cyan: #3a8a8a;
+  --cyan-light: #4fa8a8;
+  --cyan-dim: #2a6a6a;
+  --rose: #c04040;
+  --rose-light: #d46060;
+  --rose-dim: #8a3030;
+  --scrollbar-thumb: #aaaaaa;
+  --scrollbar-thumb-hover: #888888;
+  --selection-bg: rgba(184, 134, 11, 0.2);
+}
+
+/* ── Base ─────────────────────────────────────────────────────────── */
+html {
+  /* 16px base prevents iOS input-focus zoom on mobile */
+  font-size: 16px;
+  scroll-behavior: smooth;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+  font-family: 'Inter', system-ui, sans-serif;
+}
+
+body {
+  background-color: var(--bg);
+  color: var(--fg);
+  font-feature-settings: "ss01", "ss02", "cv01", "cv03";
+  /* Safe area padding for notched phones */
+  padding-top: env(safe-area-inset-top);
+  padding-bottom: env(safe-area-inset-bottom);
+  padding-left: env(safe-area-inset-left);
+  padding-right: env(safe-area-inset-right);
+}
+
+/* ── Scrollbar (minimal) ──────────────────────────────────────────── */
+::-webkit-scrollbar { width: 4px; height: 4px; }
+::-webkit-scrollbar-track { background: transparent; }
+::-webkit-scrollbar-thumb { background: var(--scrollbar-thumb); }
+::-webkit-scrollbar-thumb:hover { background: var(--scrollbar-thumb-hover); }
+
+/* ── Selection ───────────────────────────────────────────────────── */
+::selection { background: var(--selection-bg); color: var(--fg); }
+
+/* ── Focus ────────────────────────────────────────────────────────── */
+*:focus-visible {
+  outline: 1px solid var(--amber);
+  outline-offset: 1px;
+}
+
+/* ── Code ─────────────────────────────────────────────────────────── */
+pre {
+  background: var(--bg-alt);
+  border: 1px solid var(--border);
+  padding: 0.75rem 1rem;
+  overflow-x: auto;
+  font-family: 'JetBrains Mono', 'Fira Code', monospace;
+  font-size: 0.8125rem;
+  line-height: 1.5;
+}
+
+code {
+  font-family: 'JetBrains Mono', 'Fira Code', monospace;
+  font-size: 0.8125rem;
+  color: var(--amber-light);
+}
+
+pre code { color: var(--fg); }
+
+kbd {
+  font-family: 'JetBrains Mono', 'Fira Code', monospace;
+  font-size: 0.75rem;
+  background: var(--bg-card);
+  border: 1px solid var(--border);
+  padding: 0 0.375rem;
+}
+
+/* ── Form components (auth pages) ─────────────────────────────────── */
+.card {
+  background-color: var(--bg-alt);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+}
+
+.input-field {
+  width: 100%;
+  background-color: var(--bg);
+  border: 1px solid var(--border);
+  padding: 0.5rem 0.75rem 0.5rem 2.75rem;
+  color: var(--fg);
+  font-size: 0.875rem;
+  outline: none;
+  transition: border-color 0.1s;
+}
+
+.input-field::placeholder { color: var(--fg-faint); }
+.input-field:focus { border-color: var(--amber); }
+.input-field-error { border-color: var(--rose) !important; }
+
+.btn-primary {
+  width: 100%;
+  background-color: var(--amber);
+  color: var(--bg);
+  font-weight: 600;
+  font-size: 0.875rem;
+  border: none;
+  padding: 0.5rem 1rem;
+  cursor: pointer;
+  transition: background-color 0.1s;
+}
+
+.btn-primary:hover { background-color: var(--amber-light); }
+.btn-primary:disabled { opacity: 0.4; cursor: not-allowed; }
+
+.btn-ghost {
+  color: var(--fg-dim);
+  text-decoration: underline;
+  text-underline-offset: 3px;
+  transition: color 0.1s;
+  cursor: pointer;
+}
+
+.btn-ghost:hover { color: var(--fg); }
+
+/* ── Animations ──────────────────────────────────────────────────── */
+@keyframes fade-in {
+  from { opacity: 0; transform: translateY(3px); }
+  to { opacity: 1; transform: translateY(0); }
+}
+.animate-fade-in { animation: fade-in 0.15s ease-out both; }
+
+@keyframes slide-up-fade {
+  from { opacity: 0; transform: translateY(8px); }
+  to { opacity: 1; transform: translateY(0); }
+}
+.animate-slide-up-fade { animation: slide-up-fade 0.2s ease-out both; }
+
+@keyframes slide-out-down {
+  from { opacity: 1; transform: translateY(0); max-height: 500px; }
+  to { opacity: 0; transform: translateY(8px); max-height: 0; }
+}
+.animate-slide-out-down { animation: slide-out-down 0.15s ease-in both; }
+
+@keyframes shimmer {
+  0% { background-position: -200% 0; }
+  100% { background-position: 200% 0; }
+}
+.animate-shimmer {
+  background: linear-gradient(
+    90deg,
+    var(--bg-alt) 25%,
+    var(--bg-hover) 37%,
+    var(--bg-alt) 63%
+  );
+  background-size: 200% 100%;
+  animation: shimmer 1.4s ease-in-out infinite;
+}
+
+@keyframes scale-press {
+  0% { transform: scale(1); }
+  50% { transform: scale(0.92); }
+  100% { transform: scale(1); }
+}
+.animate-scale-press { animation: scale-press 0.15s ease-out; }
+
+@keyframes toast-in {
+  from { opacity: 0; transform: translateY(-6px) scale(0.96); }
+  to { opacity: 1; transform: translateY(0) scale(1); }
+}
+.animate-toast-in { animation: toast-in 0.2s ease-out both; }
+
+@keyframes toast-out {
+  from { opacity: 1; transform: translateY(0) scale(1); }
+  to { opacity: 0; transform: translateY(-6px) scale(0.96); }
+}
+.animate-toast-out { animation: toast-out 0.15s ease-in both; }
+
+@keyframes bounce-in {
+  0% { opacity: 0; transform: scale(0.8); }
+  50% { transform: scale(1.04); }
+  100% { opacity: 1; transform: scale(1); }
+}
+.animate-bounce-in { animation: bounce-in 0.25s ease-out both; }
+
+/* ── Reduced motion ──────────────────────────────────────────────── */
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+    transition-property: none !important;
+    scroll-behavior: auto !important;
+  }
+  html {
+    scroll-behavior: auto !important;
+  }
+}

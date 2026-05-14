@@ -34,6 +34,16 @@ impl TerminalInput {
         if !caps.bracketed_paste {
             paste_buffer.burst_threshold = 20;
         }
+        // PuTTY basic mode: ultra-low burst threshold, higher CTRL+V timeout
+        if caps.is_putty && caps.putty_mode == "basic" {
+            paste_buffer.burst_threshold = 10;
+            paste_buffer.ctrlv_timeout_reads = 200; // ~3s for slow remote connections
+        }
+        // PuTTY xterm mode: moderate adjustments
+        if caps.is_putty && caps.putty_mode == "xterm" {
+            paste_buffer.burst_threshold = 15;
+            paste_buffer.ctrlv_timeout_reads = 160;
+        }
         Self {
             paste_buffer,
             raw_mode: false,

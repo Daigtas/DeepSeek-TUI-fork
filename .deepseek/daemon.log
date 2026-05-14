@@ -1,0 +1,16 @@
+{"timestamp":"2026-05-10T13:18:55.250349933+00:00","event":"startup","message":"Daemon started, restored 0 hive entries"}
+{"timestamp":"2026-05-10T13:22:36.739194808+00:00","event":"startup","message":"Daemon started — hive mind will restore on first resume"}
+{"timestamp":"2026-05-10T13:24:42.708506342+00:00","event":"startup","message":"Daemon started — hive mind will restore on first resume"}
+{"timestamp":"2026-05-10T13:25:16.631955035+00:00","event":"startup","message":"Daemon started — hive mind will restore on first resume"}
+{"timestamp":"2026-05-10T13:27:59.678889324+00:00","event":"startup","message":"Daemon started — hive mind will restore on first resume"}
+{"timestamp":"2026-05-10T13:30:26.470710075+00:00","event":"startup","message":"Daemon started — hive mind will restore on first resume"}
+{"timestamp":"2026-05-10T13:30:57.815217613+00:00","event":"startup","message":"Daemon started — hive mind will restore on first resume"}
+{"timestamp":"2026-05-10T13:31:22.144702406+00:00","event":"startup","message":"Daemon started — hive mind will restore on first resume"}
+{"timestamp":"2026-05-10T13:31:40.868477006+00:00","event":"agent_started","message":"Agent test-agent (Explorer) started","data":{"agent_id":"17e6e90c-b882-4b56-8331-76b1763cac85","name":"test-agent","role":"Explorer"}}
+{"timestamp":"2026-05-10T14:18:25.781365413+00:00","event":"startup","message":"Daemon started — hive mind will restore on first resume"}
+{"timestamp":"2026-05-10T14:24:18.816406108+00:00","event":"startup","message":"Daemon started — hive mind will restore on first resume"}
+{"timestamp":"2026-05-12T15:06:57.443956314+00:00","event":"startup","message":"Daemon started — hive mind will restore on first resume"}
+{"timestamp":"2026-05-12T15:09:00.689752874+00:00","event":"startup","message":"Daemon started — hive mind will restore on first resume"}
+{"timestamp":"2026-05-12T15:09:58.580585283+00:00","event":"startup","message":"Daemon started — hive mind will restore on first resume"}
+{"timestamp":"2026-05-12T15:11:37.886227335+00:00","event":"startup","message":"Daemon started — hive mind will restore on first resume"}
+{"timestamp":"2026-05-12T15:13:49.162515133+00:00","event":"startup","message":"Daemon started — hive mind will restore on first resume"}

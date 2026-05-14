@@ -10,6 +10,7 @@ description = "Hive mind shared context, swarm orchestration, and specialized ag
 anyhow.workspace = true
 chrono.workspace = true
 deepseek-context = { workspace = true }
+deepseek-planning = { workspace = true }
 serde.workspace = true
 serde_json.workspace = true
 tokio.workspace = true

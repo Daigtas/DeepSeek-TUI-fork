@@ -30,6 +30,7 @@ use deepseek_session::SessionStore;
 use deepseek_state::StateStore;
 use deepseek_swarm::{AgentRole, AgentSpec, SwarmOrchestrator};
 use deepseek_tools::{ToolCall, ToolRegistry};
+use deepseek_tui_core::UiEvent;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -488,6 +489,193 @@ pub async fn run_stdio(config_path: Option<PathBuf>) -> Result<()> {
         }
     }
     Ok(())
+}
+
+// ── TUI mode: raw terminal input with full paste support ───────────────────
+
+/// Run the TUI in raw terminal mode with bracketed paste, burst paste, and
+/// CTRL+V detection. Reads stdin bytes through `TerminalInput` which feeds
+/// `BracketedPasteBuffer` for proper multi-line paste handling.
+///
+/// Prompts are processed asynchronously: typing Enter submits the current
+/// input line to a background task. While processing, you can continue typing
+/// — new input is merged into the active prompt queue and injected on each
+/// tool-use cycle, enabling "rethink and continue" workflows.
+pub async fn run_tui(config_path: Option<PathBuf>) -> Result<()> {
+    let opts = AppServerOptions {
+        listen: "127.0.0.1:0".parse().unwrap(),
+        config_path,
+        daemon: false,
+        pid_file: None,
+        auto_shutdown_idle: false,
+        idle_timeout_secs: 300,
+    };
+    let state = build_state(&opts)?;
+
+    let mut terminal = terminal::TerminalInput::new();
+    terminal.enable_raw_mode().context("failed to enable raw terminal mode")?;
+
+    // ── Prompt queue: background channel for submitting prompts ──
+    let (prompt_tx, mut prompt_rx) = mpsc::channel::<(String, Option<String>)>(32);
+    // ── Response channel: background task sends output back to main loop ──
+    let (output_tx, mut output_rx) = mpsc::channel::<(String, bool)>(64); // (text, is_error)
+
+    // Spawn the prompt processing background task
+    let bg_state = state.clone();
+    tokio::spawn(async move {
+        while let Some((prompt, thread_id)) = prompt_rx.recv().await {
+            let req = PromptRequest {
+                thread_id,
+                prompt: prompt.clone(),
+                model: None,
+            };
+
+            let mut rt = bg_state.runtime.lock().await;
+            match rt.handle_prompt(req, &CliRuntimeOverrides::default()).await {
+                Ok(resp) => {
+                    let _ = output_tx.send((format!("[model: {}]\n{}", resp.model, resp.output), false)).await;
+                }
+                Err(e) => {
+                    let _ = output_tx.send((format!("[error: {e}]"), true)).await;
+                }
+            }
+        }
+    });
+
+    eprintln!("╔══════════════════════════════════════════╗");
+    eprintln!("║        DeepSeek TUI v{}               ║", env!("CARGO_PKG_VERSION"));
+    eprintln!("╠══════════════════════════════════════════╣");
+    eprintln!("║  Type a prompt and press Enter.          ║");
+    eprintln!("║  Paste with Ctrl+V or Shift+Insert.      ║");
+    eprintln!("║  Type /help for commands.  Ctrl+C exit.  ║");
+    eprintln!("╚══════════════════════════════════════════╝");
+    eprintln!();
+
+    let mut input_line = String::new();
+    let mut thread_id: Option<String> = None;
+    let mut active_prompts: usize = 0;
+
+    // Helper: write to stdout in raw mode
+    macro_rules! echo {
+        ($($arg:tt)*) => {{
+            use std::io::Write;
+            let mut out = std::io::stdout();
+            let _ = write!(out, $($arg)*);
+            let _ = out.flush();
+        }};
+    }
+
+    // ── Main event loop: interleave stdin reads with output processing ──
+    loop {
+        // Drain any pending output from background tasks (non-blocking)
+        while let Ok((text, is_error)) = output_rx.try_recv() {
+            active_prompts = active_prompts.saturating_sub(1);
+            if is_error {
+                echo!("\r\x1b[K"); // clear current line
+                eprintln!("{}", text);
+            } else {
+                echo!("\r\x1b[K"); // clear the "thinking…" or input line
+                println!("{}", text);
+            }
+            println!();
+        }
+
+        // Read stdin events (blocking, but interrupted by output above)
+        let events = match terminal.read_events() {
+            Ok(ev) => ev,
+            Err(e) => {
+                echo!("\r\n[input error: {e}]\r\n");
+                break Ok(());
+            }
+        };
+
+        for event in events {
+            match event {
+                UiEvent::KeyPressed(ch) => {
+                    if ch == '\x03' || ch == '\x04' {
+                        echo!("\r\nexiting.\r\n");
+                        let _ = terminal.disable_raw_mode();
+                        return Ok(());
+                    }
+                    if ch == '\x7f' || ch == '\x08' {
+                        if !input_line.is_empty() {
+                            input_line.pop();
+                            echo!("\x08 \x08");
+                        }
+                        continue;
+                    }
+                    if ch == '\t' {
+                        // Tab completion placeholder
+                        echo!("[tab]");
+                        continue;
+                    }
+                    if ch.is_ascii_graphic() || ch == ' ' {
+                        input_line.push(ch);
+                        let mut buf = [0u8; 4];
+                        let s = ch.encode_utf8(&mut buf);
+                        echo!("{}", s);
+                    }
+                }
+                UiEvent::EnterPressed => {
+                    let prompt = input_line.trim().to_string();
+                    echo!("\r\n"); // newline after input
+                    input_line.clear();
+
+                    if prompt.is_empty() {
+                        continue;
+                    }
+
+                    // Local slash commands
+                    if prompt == "/exit" || prompt == "/quit" || prompt == "/q" {
+                        echo!("exiting.\r\n");
+                        let _ = terminal.disable_raw_mode();
+                        return Ok(());
+                    }
+                    if prompt == "/clear" {
+                        thread_id = None;
+                        echo!("[conversation cleared]\r\n\r\n");
+                        continue;
+                    }
+                    if prompt == "/status" {
+                        echo!("thread: {} | queued: {}\r\n\r\n",
+                            thread_id.as_deref().unwrap_or("none"), active_prompts);
+                        continue;
+                    }
+                    if prompt == "/help" {
+                        echo!("/exit /quit /q — exit\r\n");
+                        echo!("/clear — clear conversation\r\n");
+                        echo!("/status — show status\r\n");
+                        echo!("/paste — test paste detection\r\n");
+                        echo!("\r\n");
+                        continue;
+                    }
+                    if prompt == "/paste" {
+                        echo!("[paste detection active — try Ctrl+V, Shift+Insert, or middle-click]\r\n\r\n");
+                        continue;
+                    }
+
+                    // Submit to background prompt processor
+                    let tid = thread_id.clone();
+                    if let Err(_) = prompt_tx.send((prompt.clone(), tid)).await {
+                        echo!("[error: prompt queue full]\r\n\r\n");
+                        continue;
+                    }
+                    active_prompts += 1;
+                    echo!("[submitted — {} queued]\r\n", active_prompts);
+                }
+                UiEvent::PasteContent { content, .. } => {
+                    // Paste detected — echo and insert into input line
+                    input_line.push_str(&content);
+                    echo!("{}", content);
+                }
+                UiEvent::CtrlVPressed => {
+                    // Visual feedback during paste capture
+                    echo!("[pasting…]");
+                }
+                _ => {}
+            }
+        }
+    }
 }
 
 async fn dispatch_stdio(state: &AppState, method: &str, params: Value) -> std::result::Result<StdioDispatchResult, JsonRpcError> {

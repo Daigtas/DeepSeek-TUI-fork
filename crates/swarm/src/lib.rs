@@ -1,14 +1,31 @@
 use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::sync::Arc;
+use std::time::Duration;
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, anyhow};
 use chrono::Utc;
 use deepseek_context::HybridContextStore;
+use deepseek_planning::{PhaseAction, PhasePipeline, PlanningDir};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use tokio::sync::{Mutex, RwLock, broadcast, mpsc};
-use tracing::{debug, info, warn};
+use tokio::sync::{Mutex, RwLock, broadcast, mpsc, Semaphore};
+use tracing::{debug, error, info, warn};
 use uuid::Uuid;
+
+// ── Timeout / retry constants ──
+
+/// Default per-agent task timeout.
+const DEFAULT_TASK_TIMEOUT: Duration = Duration::from_secs(120);
+/// Heartbeat interval — agents send a heartbeat this often.
+const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(10);
+/// Heartbeat grace period — if no heartbeat for this long, agent is considered dead.
+const HEARTBEAT_GRACE: Duration = Duration::from_secs(35);
+/// Maximum concurrent agents in the swarm (backpressure).
+const MAX_CONCURRENT_AGENTS: usize = 12;
+/// Maximum retries for a failed/timed-out task.
+const MAX_RETRIES: u32 = 2;
+/// Base backoff for retries.
+const RETRY_BASE_BACKOFF: Duration = Duration::from_secs(2);
 
 // ============================================================================
 // Hive Mind — shared context across all agents
@@ -584,6 +601,12 @@ pub struct AgentHandle {
     task_tx: mpsc::Sender<SwarmMessage>,
     /// Channel to receive results from this agent.
     result_rx: Arc<Mutex<mpsc::Receiver<AgentResult>>>,
+    /// Channel to receive heartbeats from this agent.
+    heartbeat_rx: Arc<Mutex<mpsc::Receiver<()>>>,
+    /// When this agent was spawned.
+    spawned_at: chrono::DateTime<chrono::Utc>,
+    /// Per-agent task timeout (configurable).
+    pub task_timeout: Duration,
 }
 
 impl Clone for AgentHandle {
@@ -594,16 +617,37 @@ impl Clone for AgentHandle {
             name: self.name.clone(),
             task_tx: self.task_tx.clone(),
             result_rx: self.result_rx.clone(),
+            heartbeat_rx: self.heartbeat_rx.clone(),
+            spawned_at: self.spawned_at,
+            task_timeout: self.task_timeout,
         }
     }
 }
 
 impl AgentHandle {
-    /// Wait for the agent to complete and return its result.
+    /// Wait for the agent to complete and return its result, with timeout.
     /// Returns `None` if the agent's channel is closed without a result.
     pub async fn await_completion(&self) -> Option<AgentResult> {
         let mut rx = self.result_rx.lock().await;
         rx.recv().await
+    }
+
+    /// Wait for the agent to complete with a timeout.
+    /// Returns `Err` on timeout, `Ok(None)` if channel closed, `Ok(Some(result))` on success.
+    pub async fn await_with_timeout(&self) -> Result<AgentResult> {
+        let mut rx = self.result_rx.lock().await;
+        tokio::time::timeout(self.task_timeout, rx.recv())
+            .await
+            .map_err(|_| anyhow!("agent {} task timed out after {:?}", self.id, self.task_timeout))?
+            .ok_or_else(|| anyhow!("agent {} channel closed without result", self.id))
+    }
+
+    /// Check if the agent is still alive via heartbeat.
+    pub async fn is_alive(&self) -> bool {
+        let mut rx = self.heartbeat_rx.lock().await;
+        tokio::time::timeout(HEARTBEAT_GRACE, rx.recv())
+            .await
+            .is_ok()
     }
 }
 
@@ -654,6 +698,8 @@ pub struct SwarmOrchestrator {
     topology: RwLock<SwarmTopology>,
     /// Registered background workers.
     workers: RwLock<Vec<BackgroundWorker>>,
+    /// Concurrency limiter — max simultaneous agent spawns.
+    concurrency_limit: Arc<Semaphore>,
 }
 
 impl SwarmOrchestrator {
@@ -666,6 +712,7 @@ impl SwarmOrchestrator {
             results: RwLock::new(Vec::new()),
             topology: RwLock::new(SwarmTopology::Hierarchical),
             workers: RwLock::new(BackgroundWorker::predefined()),
+            concurrency_limit: Arc::new(Semaphore::new(MAX_CONCURRENT_AGENTS)),
         }
     }
 
@@ -679,17 +726,22 @@ impl SwarmOrchestrator {
             results: RwLock::new(Vec::new()),
             topology: RwLock::new(SwarmTopology::Hierarchical),
             workers: RwLock::new(BackgroundWorker::predefined()),
+            concurrency_limit: Arc::new(Semaphore::new(MAX_CONCURRENT_AGENTS)),
         }
     }
 
     /// Spawn a specialized agent into the swarm.
+    ///
+    /// Fire-and-forget: returns immediately with an AgentHandle. The agent's
+    /// tokio task acquires a concurrency permit and holds it for its lifetime.
     pub async fn spawn_agent(&self, spec: AgentSpec) -> AgentHandle {
         let id = spec.id.clone();
         let role = spec.role;
         let name = spec.name.clone();
 
-        let (task_tx, mut task_rx) = mpsc::channel::<SwarmMessage>(32);
-        let (result_tx, result_rx) = mpsc::channel::<AgentResult>(32);
+        let (task_tx, mut task_rx) = mpsc::channel::<SwarmMessage>(64);
+        let (result_tx, result_rx) = mpsc::channel::<AgentResult>(8);
+        let (heartbeat_tx, heartbeat_rx) = mpsc::channel::<()>(16);
 
         let handle = AgentHandle {
             id: id.clone(),
@@ -697,6 +749,9 @@ impl SwarmOrchestrator {
             name: name.clone(),
             task_tx: task_tx.clone(),
             result_rx: Arc::new(Mutex::new(result_rx)),
+            heartbeat_rx: Arc::new(Mutex::new(heartbeat_rx)),
+            spawned_at: Utc::now(),
+            task_timeout: DEFAULT_TASK_TIMEOUT,
         };
 
         self.agents.write().await.insert(id.clone(), handle.clone());
@@ -704,43 +759,102 @@ impl SwarmOrchestrator {
         // Spawn the agent's event loop
         let hive = self.hive.clone();
         let agent_id = id.clone();
+        let agent_name = name.clone();
+        let agent_role = role;
+        let hb_tx = heartbeat_tx.clone();
+        let sem = self.concurrency_limit.clone();
+
         tokio::spawn(async move {
-            info!(%agent_id, role = %role.label(), "swarm agent started");
-            while let Some(msg) = task_rx.recv().await {
+            // Hold the permit for the agent's lifetime
+            let _permit = sem.acquire_owned().await.expect("semaphore acquire");
+            info!(%agent_id, role = %agent_role.label(), "swarm agent started");
+
+            // ── Heartbeat loop ──
+            let hb_id = agent_id.clone();
+            let hb_role = agent_role;
+            let hb_tx2 = hb_tx.clone();
+            let heartbeat_task = tokio::spawn(async move {
+                loop {
+                    tokio::time::sleep(HEARTBEAT_INTERVAL).await;
+                    if hb_tx2.send(()).await.is_err() {
+                        debug!(%hb_id, role = %hb_role.label(), "heartbeat channel closed, stopping");
+                        break;
+                    }
+                }
+            });
+
+            // ── Main message loop ──
+            loop {
+                let msg = tokio::select! {
+                    maybe_msg = task_rx.recv() => {
+                        match maybe_msg {
+                            Some(msg) => msg,
+                            None => {
+                                warn!(%agent_id, "task channel closed, agent exiting");
+                                break;
+                            }
+                        }
+                    }
+                    _ = tokio::time::sleep(DEFAULT_TASK_TIMEOUT) => {
+                        // Idle timeout — agent received no task within timeout window.
+                        // Don't kill it; just loop again. Real task timeouts are handled
+                        // by the orchestrator's await_with_timeout.
+                        debug!(%agent_id, "agent idle heartbeat — no task received in {:?}", DEFAULT_TASK_TIMEOUT);
+                        continue;
+                    }
+                };
+
                 match msg {
                     SwarmMessage::ExecuteTask { task_id, prompt } => {
-                        debug!(%agent_id, %task_id, "agent executing task");
-                        // In a real implementation, this would call the LLM.
-                        // Here we simulate with a placeholder result.
-                        let output = format!(
-                            "[{}] executed task '{}': processed prompt '{}'",
-                            role.label(),
-                            task_id,
-                            truncate_str(&prompt, 80)
-                        );
-                        let hive_updates = vec![
-                            HiveInjection {
-                                key: format!("task.{}.result", task_id),
-                                value: serde_json::json!({
-                                    "status": "completed",
-                                    "agent": agent_id,
-                                    "role": role.label(),
-                                    "summary": truncate_str(&prompt, 200)
-                                }),
-                                tags: vec!["task-result".into(), role.label().to_lowercase()],
-                                confidence: 0.9,
-                            },
-                        ];
-                        let _ = result_tx.send(AgentResult {
-                            agent_id: agent_id.clone(),
-                            task_id: Some(task_id),
-                            success: true,
-                            output,
-                            hive_updates,
-                        }).await;
+                        info!(%agent_id, %task_id, "agent executing task: {}", truncate_str(&prompt, 120));
+
+                        // ── Execute with per-task timeout ──
+                        let exec_result = tokio::time::timeout(
+                            DEFAULT_TASK_TIMEOUT,
+                            execute_agent_task(
+                                &agent_id,
+                                &agent_name,
+                                agent_role,
+                                &task_id,
+                                &prompt,
+                                &hive,
+                            ),
+                        ).await;
+
+                        match exec_result {
+                            Ok(Ok((output, hive_updates))) => {
+                                let _ = result_tx.send(AgentResult {
+                                    agent_id: agent_id.clone(),
+                                    task_id: Some(task_id.clone()),
+                                    success: true,
+                                    output,
+                                    hive_updates,
+                                }).await;
+                            }
+                            Ok(Err(e)) => {
+                                error!(%agent_id, %task_id, "agent task error: {e}");
+                                let _ = result_tx.send(AgentResult {
+                                    agent_id: agent_id.clone(),
+                                    task_id: Some(task_id.clone()),
+                                    success: false,
+                                    output: format!("error: {e}"),
+                                    hive_updates: vec![],
+                                }).await;
+                            }
+                            Err(_elapsed) => {
+                                error!(%agent_id, %task_id, "agent task timed out after {:?}", DEFAULT_TASK_TIMEOUT);
+                                let _ = result_tx.send(AgentResult {
+                                    agent_id: agent_id.clone(),
+                                    task_id: Some(task_id.clone()),
+                                    success: false,
+                                    output: format!("task timed out after {:?}", DEFAULT_TASK_TIMEOUT),
+                                    hive_updates: vec![],
+                                }).await;
+                            }
+                        }
                     }
                     SwarmMessage::Broadcast { from, message } => {
-                        debug!(%agent_id, %from, "agent received broadcast: {}", message);
+                        debug!(%agent_id, %from, "agent received broadcast: {}", truncate_str(&message, 120));
                     }
                     SwarmMessage::ContextUpdate { key, value } => {
                         debug!(%agent_id, %key, "agent received context update");
@@ -758,6 +872,11 @@ impl SwarmOrchestrator {
                     }
                 }
             }
+
+            // Cleanup
+            heartbeat_task.abort();
+            let _ = hb_tx.send(()).await; // final flush
+            info!(%agent_id, "swarm agent exited");
         });
 
         info!(%id, role = %role.label(), name = %name, "agent spawned into swarm");
@@ -817,7 +936,7 @@ impl SwarmOrchestrator {
     }
 
     /// Execute a task graph: spawn agents per role, respect dependencies,
-    /// collect results, update hive mind.
+    /// collect results CONCURRENTLY (not sequentially), with timeouts and retry.
     pub async fn execute_graph(&self, graph: &mut TaskGraph) -> Result<Vec<AgentResult>> {
         info!(
             objective = %graph.objective,
@@ -856,7 +975,6 @@ impl SwarmOrchestrator {
                         warn!(task_id = %node.id, "task failed, skipping dependent tasks");
                     }
                 }
-                // Mark remaining pending tasks as failed
                 for node in graph.nodes.iter_mut() {
                     if node.status == TaskStatus::Pending {
                         node.status = TaskStatus::Failed;
@@ -866,28 +984,53 @@ impl SwarmOrchestrator {
                 break;
             }
 
+            // ── Phase 1: Spawn all agents, then batch-assign tasks ──
+            // Spawn agents first (they acquire semaphore permits), then assign.
             let mut handles = Vec::new();
-
             for (task_id, role, prompt) in &ready {
-                let spec = AgentSpec::for_role(*role, &format!("{}-{}", role.label(), &task_id[..8]));
+                let spec = AgentSpec::for_role(*role, &format!("{}-{}", role.label(), &task_id[..task_id.len().min(8)]));
                 let agent_id = spec.id.clone();
                 let handle = self.spawn_agent(spec).await;
 
                 graph.mark_in_progress(task_id, &agent_id);
-
                 self.assign_task(&agent_id, task_id, prompt).await?;
 
-                handles.push((task_id.clone(), agent_id, handle));
+                handles.push((task_id.clone(), agent_id, handle, prompt.clone(), 0u32));
             }
 
-            // Wait for all spawned agents to complete
-            for (task_id, agent_id, handle) in handles {
-                let mut rx = handle.result_rx.lock().await;
-                if let Some(result) = rx.recv().await {
-                    // Inject agent's hive updates
+            // ── Phase 2+3: Collect results CONCURRENTLY via spawned tasks + channel ──
+            // Keep a retry_tx clone alive for potential retry spawns
+            let handle_count = handles.len();
+            let (tx, mut rx) = mpsc::channel::<(String, String, AgentResult, String, u32)>(handle_count * 2);
+            let retry_tx = tx.clone(); // kept alive for retries
+            let hive = self.hive.clone();
+
+            for (task_id, agent_id, handle, prompt, retries) in handles {
+                let tx = tx.clone();
+                let hive_c = hive.clone();
+                let task_id_c = task_id.clone();
+                let agent_id_c = agent_id.clone();
+                let prompt_c = prompt.clone();
+
+                tokio::spawn(async move {
+                    // Wait for result with timeout
+                    let result = match handle.await_with_timeout().await {
+                        Ok(r) => r,
+                        Err(e) => {
+                            warn!(%task_id_c, %agent_id_c, "agent timed out: {e}");
+                            AgentResult {
+                                agent_id: agent_id_c.clone(),
+                                task_id: Some(task_id_c.clone()),
+                                success: false,
+                                output: format!("timeout: {e}"),
+                                hive_updates: vec![],
+                            }
+                        }
+                    };
+
+                    // Inject hive updates
                     for update in &result.hive_updates {
-                        let _ = self
-                            .hive
+                        let _ = hive_c
                             .inject(
                                 &update.key,
                                 update.value.clone(),
@@ -898,19 +1041,73 @@ impl SwarmOrchestrator {
                             .await;
                     }
 
-                    if result.success {
-                        graph.mark_completed(
-                            &task_id,
-                            result.output.clone(),
-                        );
-                    } else {
-                        graph.mark_failed(&task_id, &result.output);
-                    }
+                    let _ = tx.send((task_id_c, agent_id_c, result, prompt_c, retries)).await;
+                });
+            }
 
-                    all_results.push(result);
+            // Drop the original tx so the channel closes when all spawned tasks finish
+            drop(tx);
+
+            // ── Process results as they arrive on the channel ──
+            let mut pending = handle_count;
+            while let Some((task_id, agent_id, result, prompt, retries)) = rx.recv().await {
+                pending -= 1;
+
+                if result.success {
+                    graph.mark_completed(&task_id, result.output.clone());
+                } else if retries < MAX_RETRIES {
+                    // ── Retry failed/timed-out task ──
+                    warn!(%task_id, retries, "task failed, retrying...");
+                    let backoff = RETRY_BASE_BACKOFF * 2u32.pow(retries);
+                    tokio::time::sleep(backoff).await;
+
+                    let spec = AgentSpec::for_role(
+                        AgentRole::General,
+                        &format!("retry-{}-{}", &task_id[..task_id.len().min(6)], retries + 1),
+                    );
+                    let retry_handle = self.spawn_agent(spec).await;
+                    graph.mark_in_progress(&task_id, &retry_handle.id);
+                    self.assign_task(&retry_handle.id, &task_id, &prompt).await?;
+
+                    // Spawn retry result collector
+                    let tx2 = retry_tx.clone();
+                    let hive_c = self.hive.clone();
+                    let tid = task_id.clone();
+                    let aid = retry_handle.id.clone();
+                    pending += 1;
+                    tokio::spawn(async move {
+                        let r = match retry_handle.await_with_timeout().await {
+                            Ok(r) => r,
+                            Err(e) => AgentResult {
+                                agent_id: aid.clone(),
+                                task_id: Some(tid.clone()),
+                                success: false,
+                                output: format!("retry timeout: {e}"),
+                                hive_updates: vec![],
+                            }
+                        };
+                        for update in &r.hive_updates {
+                            let _ = hive_c.inject(
+                                &update.key,
+                                update.value.clone(),
+                                &r.agent_id,
+                                update.tags.clone(),
+                                update.confidence,
+                            ).await;
+                        }
+                        let _ = tx2.send((tid, aid, r, prompt, retries + 1)).await;
+                    });
+                    continue;
+                } else {
+                    graph.mark_failed(&task_id, &result.output);
                 }
 
-                self.shutdown_agent(&agent_id).await?;
+                all_results.push(result);
+                let _ = self.shutdown_agent(&agent_id).await;
+
+                if pending == 0 {
+                    break;
+                }
             }
         }
 
@@ -1189,6 +1386,304 @@ impl SwarmTopology {
 }
 
 // ============================================================================
+// GSD Planning Director — bridges deepseek-planning with swarm orchestration
+// ============================================================================
+
+/// Coordinates the GSD planning system with the swarm orchestrator.
+///
+/// The `PlanningDirector` is the primary orchestration layer:
+/// 1. Reads planning artifacts (ROADMAP.md, STATE.md, REQUIREMENTS.md, plan files)
+/// 2. Uses `PhasePipeline` to determine the next action
+/// 3. Derives swarm agent tasks from phase requirements
+/// 4. Syncs planning state into the hive mind for agent visibility
+/// 5. Tracks requirement status and updates STATE.md
+pub struct PlanningDirector {
+    /// The planning directory (typically `.planning/` in the workspace).
+    pub planning: PlanningDir,
+    /// Reference to the swarm orchestrator for spawning agents.
+    pub swarm: Arc<SwarmOrchestrator>,
+}
+
+impl PlanningDirector {
+    /// Create a new planning director.
+    pub fn new(planning: PlanningDir, swarm: Arc<SwarmOrchestrator>) -> Self {
+        Self { planning, swarm }
+    }
+
+    /// Sync all planning state into the hive mind so agents can see it.
+    pub async fn sync_to_hive(&self) -> Result<()> {
+        // Sync project state
+        if let Ok(state) = self.planning.read_state() {
+            self.swarm.hive.inject(
+                "planning.state",
+                serde_json::to_value(&state)?,
+                "planning-director",
+                vec!["planning".into(), "state".into()],
+                1.0,
+            ).await?;
+        }
+
+        // Sync roadmap
+        if let Ok(roadmap) = self.planning.read_roadmap() {
+            self.swarm.hive.inject(
+                "planning.roadmap",
+                serde_json::to_value(&roadmap)?,
+                "planning-director",
+                vec!["planning".into(), "roadmap".into()],
+                1.0,
+            ).await?;
+
+            // Inject current phase summary for easy agent access
+            if let Some(current) = roadmap.current_phase {
+                let phase = roadmap.phases.iter().find(|p| p.number == current);
+                if let Some(phase) = phase {
+                    self.swarm.hive.inject(
+                        "planning.current_phase",
+                        serde_json::json!({
+                            "number": phase.number,
+                            "name": phase.name,
+                            "status": format!("{:?}", phase.status),
+                            "description": phase.description,
+                        }),
+                        "planning-director",
+                        vec!["planning".into(), "phase".into()],
+                        1.0,
+                    ).await?;
+                }
+            }
+        }
+
+        // Sync requirements
+        if let Ok(reqs) = self.planning.read_requirements() {
+            self.swarm.hive.inject(
+                "planning.requirements",
+                serde_json::to_value(&reqs)?,
+                "planning-director",
+                vec!["planning".into(), "requirements".into()],
+                1.0,
+            ).await?;
+        }
+
+        info!("planning state synced to hive mind");
+        Ok(())
+    }
+
+    /// Determine the next development action and spawn appropriate agents.
+    ///
+    /// This is the core orchestration loop — call periodically or after agent
+    /// completions to drive the GSD workflow forward.
+    pub async fn tick(&self) -> Result<Option<PhaseAction>> {
+        // Read current state
+        let state = self.planning.read_state().unwrap_or_else(|_| {
+            deepseek_planning::ProjectState {
+                phase_status: "initializing".into(),
+                current_work: "setting up planning system".into(),
+                blockers: vec![],
+                decisions: vec![],
+                metrics: std::collections::HashMap::new(),
+                last_updated: Utc::now().to_rfc3339(),
+            }
+        });
+
+        let roadmap = match self.planning.read_roadmap() {
+            Ok(r) => r,
+            Err(_) => {
+                warn!("no roadmap found — planning director idle");
+                return Ok(None);
+            }
+        };
+
+        // Check for blockers — if blocked, pause orchestration
+        if !state.blockers.is_empty() {
+            self.swarm.hive.inject(
+                "planning.blockers",
+                serde_json::json!(state.blockers),
+                "planning-director",
+                vec!["planning".into(), "blocker".into()],
+                1.0,
+            ).await?;
+            return Ok(Some(PhaseAction::Idle));
+        }
+
+        // Determine next action from the phase pipeline
+        let action = PhasePipeline::next_action(&state, &roadmap);
+
+        match &action {
+            PhaseAction::Discuss(phase_num) => {
+                info!(phase = phase_num, "planning director: discuss phase");
+
+                // Spawn a Planner agent to lead discussion
+                let spec = AgentSpec::for_role(AgentRole::Planner, &format!("discuss-phase-{phase_num}"));
+                let handle = self.swarm.spawn_agent(spec).await;
+
+                let prompt = format!(
+                    "Discuss phase {phase_num}: read the phase description from the roadmap, \
+                     identify design decisions needed, and propose a concrete plan. \
+                     Write findings to hive key `planning.phase.{phase_num}.discussion`."
+                );
+                self.swarm.assign_task(&handle.id, &format!("discuss-phase-{phase_num}"), &prompt).await?;
+
+                // Update state
+                let mut new_state = state.clone();
+                new_state.phase_status = format!("discussing phase {phase_num}");
+                new_state.current_work = format!("gathering requirements and design decisions for phase {phase_num}");
+                new_state.last_updated = Utc::now().to_rfc3339();
+                self.planning.write_state(&new_state).ok();
+            }
+            PhaseAction::Plan(phase_num) => {
+                info!(phase = phase_num, "planning director: plan phase");
+
+                let spec = AgentSpec::for_role(AgentRole::Planner, &format!("plan-phase-{phase_num}"));
+                let handle = self.swarm.spawn_agent(spec).await;
+
+                let prompt = format!(
+                    "Create a detailed implementation plan for phase {phase_num}. \
+                     Break down into concrete tasks with effort estimates. \
+                     Write the plan to hive key `planning.phase.{phase_num}.plan`."
+                );
+                self.swarm.assign_task(&handle.id, &format!("plan-phase-{phase_num}"), &prompt).await?;
+
+                let mut new_state = state.clone();
+                new_state.phase_status = format!("planning phase {phase_num}");
+                new_state.current_work = format!("creating implementation plan for phase {phase_num}");
+                new_state.last_updated = Utc::now().to_rfc3339();
+                self.planning.write_state(&new_state).ok();
+            }
+            PhaseAction::Execute(phase_num) => {
+                info!(phase = phase_num, "planning director: execute phase");
+
+                // Read the phase plan to determine tasks
+                if let Ok(plans) = self.planning.list_plans(*phase_num) {
+                    for plan in plans {
+                        if plan.status != deepseek_planning::PlanStatus::Completed {
+                            // Spawn implementer for each pending plan
+                            let spec = AgentSpec::for_role(
+                                AgentRole::Implementer,
+                                &format!("exec-{}-{}", phase_num, plan.plan_id),
+                            );
+                            let handle = self.swarm.spawn_agent(spec).await;
+
+                            let prompt = format!(
+                                "Execute plan {} (phase {}): {}. Tasks: {}. \
+                                 Write results to hive key `planning.plan.{}.result`.",
+                                plan.plan_id, phase_num, plan.title,
+                                plan.tasks.join(", "),
+                                plan.plan_id,
+                            );
+                            self.swarm.assign_task(
+                                &handle.id,
+                                &format!("exec-{}-{}", phase_num, plan.plan_id),
+                                &prompt,
+                            ).await?;
+                        }
+                    }
+                }
+
+                let mut new_state = state.clone();
+                new_state.phase_status = format!("executing phase {phase_num}");
+                new_state.current_work = format!("implementing plans for phase {phase_num}");
+                new_state.last_updated = Utc::now().to_rfc3339();
+                self.planning.write_state(&new_state).ok();
+            }
+            PhaseAction::Verify(phase_num) => {
+                info!(phase = phase_num, "planning director: verify phase");
+
+                // Spawn reviewer + tester
+                let review_spec = AgentSpec::for_role(AgentRole::Reviewer, &format!("review-phase-{phase_num}"));
+                let test_spec = AgentSpec::for_role(AgentRole::Tester, &format!("test-phase-{phase_num}"));
+
+                let review_handle = self.swarm.spawn_agent(review_spec).await;
+                let test_handle = self.swarm.spawn_agent(test_spec).await;
+
+                let review_prompt = format!(
+                    "Review all changes from phase {phase_num}. Check for code quality, \
+                     architectural consistency, and adherence to requirements. \
+                     Write findings to hive key `planning.phase.{phase_num}.review`."
+                );
+                let test_prompt = format!(
+                    "Test all changes from phase {phase_num}. Run test suite, \
+                     check for regressions, verify edge cases. \
+                     Write results to hive key `planning.phase.{phase_num}.test`."
+                );
+
+                self.swarm.assign_task(&review_handle.id, &format!("review-phase-{phase_num}"), &review_prompt).await?;
+                self.swarm.assign_task(&test_handle.id, &format!("test-phase-{phase_num}"), &test_prompt).await?;
+
+                let mut new_state = state.clone();
+                new_state.phase_status = format!("verifying phase {phase_num}");
+                new_state.current_work = format!("reviewing and testing phase {phase_num} results");
+                new_state.last_updated = Utc::now().to_rfc3339();
+                self.planning.write_state(&new_state).ok();
+            }
+            PhaseAction::Ship(phase_num) => {
+                info!(phase = phase_num, "planning director: ship phase");
+
+                // Mark phase as complete
+                let mut new_roadmap = roadmap.clone();
+                if let Some(phase) = new_roadmap.phases.iter_mut().find(|p| p.number == *phase_num) {
+                    phase.status = deepseek_planning::PhaseStatus::Completed;
+                }
+                self.planning.write_roadmap(&new_roadmap).ok();
+
+                let mut new_state = state.clone();
+                new_state.phase_status = format!("phase {phase_num} shipped");
+                new_state.current_work = "determining next phase".into();
+                new_state.last_updated = Utc::now().to_rfc3339();
+                self.planning.write_state(&new_state).ok();
+            }
+            PhaseAction::Complete => {
+                info!("planning director: all phases complete");
+
+                let mut new_state = state.clone();
+                new_state.phase_status = "complete".into();
+                new_state.current_work = "project complete — monitoring".into();
+                new_state.last_updated = Utc::now().to_rfc3339();
+                self.planning.write_state(&new_state).ok();
+            }
+            PhaseAction::Idle => {
+                // Nothing to do — check background workers instead
+                debug!("planning director: idle (blocked or no action)");
+            }
+        }
+
+        // Always sync state back to hive after any change
+        self.sync_to_hive().await?;
+
+        Ok(Some(action))
+    }
+
+    /// Mark a requirement as implemented in the planning system.
+    pub async fn complete_requirement(&self, req_id: &str) -> Result<()> {
+        let mut reqs = self.planning.read_requirements().unwrap_or_else(|_| {
+            deepseek_planning::RequirementsDoc {
+                project_name: "unknown".into(),
+                requirements: vec![],
+            }
+        });
+
+        if let Some(req) = reqs.requirements.iter_mut().find(|r| r.id == req_id) {
+            req.status = deepseek_planning::ReqStatus::Implemented;
+            self.planning.write_requirements(&reqs)?;
+
+            // Notify hive
+            self.swarm.hive.inject(
+                &format!("planning.req.{req_id}"),
+                serde_json::json!({
+                    "id": req_id,
+                    "status": "implemented",
+                    "completed_at": Utc::now().to_rfc3339(),
+                }),
+                "planning-director",
+                vec!["planning".into(), "requirement".into(), "completed".into()],
+                1.0,
+            ).await?;
+        }
+
+        Ok(())
+    }
+}
+
+// ============================================================================
 // Background workers
 // ============================================================================
 
@@ -1287,6 +1782,55 @@ fn truncate_value(value: &Value, max_chars: usize) -> String {
     } else {
         format!("{}…", &s[..max_chars])
     }
+}
+
+// ── Agent task executor (called inside agent event loop) ──
+
+/// Execute a single task inside an agent's event loop.
+///
+/// In production this would call the LLM. Currently it simulates execution
+/// with a placeholder result, but the architecture supports real LLM calls
+/// via the same interface.
+async fn execute_agent_task(
+    agent_id: &str,
+    agent_name: &str,
+    role: AgentRole,
+    task_id: &str,
+    prompt: &str,
+    _hive: &HiveMind,
+) -> Result<(String, Vec<HiveInjection>)> {
+    // ── Simulation (replace with real LLM call) ──
+    // In production: query the LLM with the prompt, collect tool calls, etc.
+
+    // Simulate variable processing time to exercise the timeout machinery
+    let complexity = (prompt.len() as u64).min(500);
+    let sim_delay = Duration::from_millis(50 + complexity / 2);
+    tokio::time::sleep(sim_delay).await;
+
+    let output = format!(
+        "[{role}] {name} executed task '{task_id}': {summary}",
+        role = role.label(),
+        name = agent_name,
+        task_id = task_id,
+        summary = truncate_str(prompt, 200)
+    );
+
+    let hive_updates = vec![
+        HiveInjection {
+            key: format!("task.{task_id}.result"),
+            value: serde_json::json!({
+                "status": "completed",
+                "agent": agent_id,
+                "role": role.label(),
+                "summary": truncate_str(prompt, 300),
+                "completed_at": Utc::now().to_rfc3339(),
+            }),
+            tags: vec!["task-result".into(), role.label().to_lowercase()],
+            confidence: 0.9,
+        },
+    ];
+
+    Ok((output, hive_updates))
 }
 
 fn truncate_str(s: &str, max_chars: usize) -> String {
@@ -1449,7 +1993,7 @@ mod tests {
 
     // -- Swarm orchestrator ----------------------------------------------
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn orchestrator_spawns_and_runs_agent() {
         let swarm = SwarmOrchestrator::new();
         let spec = AgentSpec::for_role(AgentRole::Explorer, "test-explorer");
@@ -1461,14 +2005,17 @@ mod tests {
         swarm.assign_task(&agent_id, "task-1", "explore the code").await.unwrap();
 
         let mut rx = handle.result_rx.lock().await;
-        let result = rx.recv().await.expect("result");
+        let result = tokio::time::timeout(Duration::from_secs(10), rx.recv())
+            .await
+            .expect("agent result timed out")
+            .expect("result");
         assert!(result.success);
         assert_eq!(result.task_id, Some("task-1".into()));
 
         swarm.shutdown_agent(&agent_id).await.unwrap();
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn orchestrator_executes_task_graph() {
         let swarm = SwarmOrchestrator::new();
         let mut graph = TaskGraph::new("simple test");
@@ -1486,7 +2033,10 @@ mod tests {
         };
         graph.add_node(task);
 
-        let results = swarm.execute_graph(&mut graph).await.expect("execute");
+        let results = tokio::time::timeout(Duration::from_secs(15), swarm.execute_graph(&mut graph))
+            .await
+            .expect("execute_graph timed out")
+            .expect("execute");
         assert!(!results.is_empty());
         assert!(results[0].success);
         assert!(graph.is_done());

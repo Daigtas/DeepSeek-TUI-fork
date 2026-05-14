@@ -1,0 +1,19 @@
+{
+  "agents": [
+    {
+      "agent_id": "hive-worker-1",
+      "status": "active",
+      "task": "verify build system"
+    },
+    {
+      "agent_id": "hive-worker-2",
+      "status": "done",
+      "task": "build via orchestrator",
+      "result": "Build succeeded in 48s. Worker-1 was NOT building when checked (no BUILD-LOCK existed). Acquired lock, ran build, succeeded. Lock went stale due to tool timeout but was cleaned up."
+    }
+  ],
+  "current_build": null,
+  "build_queue": [],
+  "last_build_at": "2025-07-18T15:27:25Z",
+  "errors": []
+}

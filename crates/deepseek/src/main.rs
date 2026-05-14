@@ -3,7 +3,7 @@ use std::path::PathBuf;
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
-use deepseek_app_server::{AppServerOptions, run, run_stdio};
+use deepseek_app_server::{AppServerOptions, run, run_stdio, run_tui};
 
 /// DeepSeek TUI — AI-powered terminal workspace
 #[derive(Debug, Parser)]
@@ -49,6 +49,8 @@ struct Cli {
 enum Command {
     /// Start the daemon server (HTTP API)
     Serve,
+    /// Run in terminal UI mode (raw mode with full paste support)
+    Tui,
     /// Run in stdio JSON-RPC mode (for IDE/editor integration)
     Stdio,
     /// Show daemon status
@@ -183,6 +185,14 @@ fn main() -> Result<()> {
                 auto_shutdown_idle: cli.auto_shutdown_idle,
                 idle_timeout_secs: cli.idle_timeout_secs,
             }))
+        }
+        Command::Tui => {
+            let rt = tokio::runtime::Builder::new_multi_thread()
+                .enable_all()
+                .build()
+                .context("failed to build tokio runtime")?;
+
+            rt.block_on(run_tui(cli.config))
         }
         Command::Stdio => {
             let rt = tokio::runtime::Builder::new_multi_thread()
