@@ -163,6 +163,17 @@ cargo build --release
 
 The binary is at `target/release/deepseek`.
 
+### Web UI Setup
+
+```bash
+cd web
+npm install
+npm run build
+npm start        # or: sudo systemctl enable --now deepseek-tui-web
+```
+
+The web UI runs on port 3100 and connects to the daemon's WebSocket endpoint.
+
 ### Daemon Setup (systemd)
 
 ```bash
@@ -181,6 +192,41 @@ sudo systemctl enable --now deepseek
 | `GET /daemon/progress` | Recent progress log entries |
 | `GET /swarm/agents` | Active agent list |
 | `GET /hive/summary` | Hive mind summary |
+
+---
+
+### 11. Web UI (`web/` directory)
+
+A full Next.js 16 web application providing a browser-based interface to the TUI:
+
+- **Multi-mode agent** — Agent, Plan, YOLO, and Agency modes with configurable system prompts
+- **Real-time streaming** — Server-Sent Events streaming with tool call visualization and mid-task interruption
+- **Session management** — Create, rename, delete, and search chat sessions with server-side persistence
+- **WebSocket backend** — `ws-server.ts` handles chat streams, tool approvals, and disconnection recovery via daemonized tasks
+- **Settings system** — Model selection, context limits, theme switching, and hook configuration (system prompt extensions, custom instructions, plugins)
+- **Mobile-first design** — Safe area insets, 44px touch targets, responsive breakpoints, WCAG AA accessibility
+- **ChatSkeleton** — Shimmer loading placeholders for chat session loading
+
+### 12. Agency Engine (`web/src/lib/agency/`)
+
+Complete web development agency simulation with hierarchical delegation:
+
+- **11 roles across 4 levels** — Leadership (CEO, CTO), Management (PM, Tech Lead), Execution (Senior/Mid/Junior Dev), Specialists (Designer, QA, DevOps, Security)
+- **72 team members** — Each with real names, personality traits, Belbin team roles, catchphrases, bios, and emoji avatars
+- **Task routing** — Automatic role assignment based on task keywords (audit→Security, design→Designer, deploy→DevOps)
+- **Sprint system** — 2-week sprints with backlog management, burndown charts, and Scrum ceremonies (standup, planning, review, retrospective)
+- **Quality gates** — Role-based approval authority, review requirements, and delegation rules
+- **Personality system** — 16 personality traits combined with 9 Belbin roles for realistic team dynamics
+
+### 13. Hive-Mind Coordination (`web/.deepseek/`)
+
+Sub-agent coordination system for parallel development workflows:
+
+- **Build mutex** — File-based lock prevents concurrent builds from corrupting `.next/`
+- **Shared state** — `AGENT-STATE.json` task board visible to all agents
+- **Turn log** — `TURN-LOG.md` append-only action log for agent coordination
+- **Chunking strategy** — 400-line file chunking for sub-agents to avoid API timeouts
+- **Configuration** — `config.toml` with sub-agent timeout (600s), chunking, and hive-mind settings
 
 ---
 
