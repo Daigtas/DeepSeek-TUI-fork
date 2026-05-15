@@ -17,10 +17,11 @@ export async function middleware(request: NextRequest) {
     }
 
     return NextResponse.next();
-  } catch {
-    // If auth check fails (e.g. transient DB error), allow the request.
-    // The page-level auth check will handle the actual enforcement.
-    return NextResponse.next();
+  } catch (err) {
+    console.error("[middleware] Auth check failed:", err instanceof Error ? err.message : String(err));
+    const loginUrl = new URL("/login", request.url);
+    loginUrl.searchParams.set("redirect", request.nextUrl.pathname);
+    return NextResponse.redirect(loginUrl);
   }
 }
 
