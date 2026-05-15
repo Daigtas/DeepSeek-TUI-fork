@@ -124,7 +124,8 @@ async function loadSessionMessages(sessionId: string): Promise<ChatMessage[]> {
       take: 100,
     });
     return messages.map(m => ({ role: m.role as ChatMessage["role"], content: m.content }));
-  } catch {
+  } catch (err) {
+    console.error("[ws] loadSessionMessages failed:", err instanceof Error ? err.message : String(err));
     return [];
   }
 }
