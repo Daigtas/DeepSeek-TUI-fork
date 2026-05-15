@@ -1,8 +1,16 @@
 # DeepSeek TUI (Fork)
 
-> AI-powered terminal workspace with **daemon mode**, **swarm orchestration**, **session persistence**, and **hybrid context storage** — built on DeepSeek V4.
+> AI-powered development platform with **daemon mode**, **swarm orchestration**, **web UI**, **agency engine**, **session persistence**, and **hybrid context storage** — built on DeepSeek V4.
 
-This is a fork of [DeepSeek TUI](https://github.com/DeepSeek-TUI/DeepSeek-TUI) that adds backend infrastructure for running the agent as a long-lived daemon with swarm coordination, persistent sessions, and a SQLite-backed context store. The TUI remains fully compatible with the upstream project.
+This fork of [DeepSeek TUI](https://github.com/DeepSeek-TUI/DeepSeek-TUI) adds:
+- **Web UI** — Next.js 16 browser interface with multi-mode agent chat, streaming, and session management
+- **Agency Engine** — 11-role development agency hierarchy with 72 team members, sprint system, and task routing
+- **Hive-Mind** — Sub-agent coordination with build mutex, shared state, and chunking strategy
+- **Daemon mode** — Long-lived background agent with HTTP API, swarm coordination, and persistent sessions
+- **Swarm orchestration** — Multi-agent task decomposition with DAG-based scheduling
+- **Hybrid context** — SQLite + in-memory cache with full-text search
+
+All upstream functionality remains intact.
 
 ---
 
@@ -103,7 +111,42 @@ Extended the original event system with production features:
 - **Capability filtering** — `filter_by_capabilities(Capabilities { reasoning: true, .. })`
 - **Active models** — `active_models()` returns non-deprecated entries only
 
-### 10. App Server Upgrades (`deepseek-app-server`)
+### 10. Web UI (`web/` directory)
+
+A full Next.js 16 web application providing a browser-based interface to the TUI daemon:
+
+- **Multi-mode agent** — Agent, Plan, YOLO, and Agency modes with configurable system prompts
+- **Real-time streaming** — Server-Sent Events streaming with tool call visualization and mid-task interruption
+- **Session management** — Create, rename, delete, and search chat sessions with server-side persistence
+- **WebSocket backend** — `ws-server.ts` handles chat streams and disconnection recovery via daemonized tasks
+- **Settings system** — Model selection, context limits, theme switching, and hook configuration
+- **Mobile-first design** — Safe area insets, 44px touch targets, responsive breakpoints, WCAG AA accessibility
+- **ChatSkeleton** — Shimmer loading placeholders for chat session loading
+- **Slash commands** — `/help`, `/model`, `/compact`, `/agents`, `/hive`, `/sessions`, `/progress`
+
+### 11. Agency Engine (`web/src/lib/agency/`)
+
+Complete web development agency simulation with hierarchical delegation, inspired by real agency structures (DECODE Pod model, Spotify Squad/Tribe, Netguru):
+
+- **11 roles across 4 levels** — Leadership (CEO, CTO), Management (PM, Tech Lead), Execution (Senior/Mid/Junior Dev), Specialists (Designer, QA, DevOps, Security)
+- **72 team members** — Each with real names, personality traits, Belbin team roles, catchphrases, bios, and emoji avatars
+- **Task routing** — Automatic role assignment based on task keywords (audit→Security, design→Designer, deploy→DevOps)
+- **Sprint system** — 2-week sprints with backlog management, burndown charts, and Scrum ceremonies (standup, planning, review, retrospective)
+- **Quality gates** — Role-based approval authority, review requirements, and delegation rules
+- **Personality system** — 16 personality traits combined with 9 Belbin roles for realistic team dynamics
+
+### 12. Hive-Mind Coordination (`web/.deepseek/`)
+
+Sub-agent coordination system for parallel development workflows:
+
+- **Build mutex** — File-based lock prevents concurrent builds from corrupting `.next/`
+- **Shared state** — `AGENT-STATE.json` task board visible to all agents
+- **Turn log** — `TURN-LOG.md` append-only action log for agent coordination
+- **Chunking strategy** — 400-line file chunking for sub-agents to avoid API timeouts (120s→600s)
+- **Build orchestrator** — `scripts/build-orchestrator.sh` serializes agent builds via mutex
+- **Configuration** — `config.toml` with sub-agent timeout, chunking, and hive-mind settings
+
+### 13. App Server Upgrades (`deepseek-app-server`)
 
 - **Daemon state** — Tracks connected clients, detached mode, active task count, and uptime
 - **Daemon API endpoints** — `/healthz`, `/daemon/status`, `/daemon/resume`, `/daemon/progress`
@@ -192,41 +235,6 @@ sudo systemctl enable --now deepseek
 | `GET /daemon/progress` | Recent progress log entries |
 | `GET /swarm/agents` | Active agent list |
 | `GET /hive/summary` | Hive mind summary |
-
----
-
-### 11. Web UI (`web/` directory)
-
-A full Next.js 16 web application providing a browser-based interface to the TUI:
-
-- **Multi-mode agent** — Agent, Plan, YOLO, and Agency modes with configurable system prompts
-- **Real-time streaming** — Server-Sent Events streaming with tool call visualization and mid-task interruption
-- **Session management** — Create, rename, delete, and search chat sessions with server-side persistence
-- **WebSocket backend** — `ws-server.ts` handles chat streams, tool approvals, and disconnection recovery via daemonized tasks
-- **Settings system** — Model selection, context limits, theme switching, and hook configuration (system prompt extensions, custom instructions, plugins)
-- **Mobile-first design** — Safe area insets, 44px touch targets, responsive breakpoints, WCAG AA accessibility
-- **ChatSkeleton** — Shimmer loading placeholders for chat session loading
-
-### 12. Agency Engine (`web/src/lib/agency/`)
-
-Complete web development agency simulation with hierarchical delegation:
-
-- **11 roles across 4 levels** — Leadership (CEO, CTO), Management (PM, Tech Lead), Execution (Senior/Mid/Junior Dev), Specialists (Designer, QA, DevOps, Security)
-- **72 team members** — Each with real names, personality traits, Belbin team roles, catchphrases, bios, and emoji avatars
-- **Task routing** — Automatic role assignment based on task keywords (audit→Security, design→Designer, deploy→DevOps)
-- **Sprint system** — 2-week sprints with backlog management, burndown charts, and Scrum ceremonies (standup, planning, review, retrospective)
-- **Quality gates** — Role-based approval authority, review requirements, and delegation rules
-- **Personality system** — 16 personality traits combined with 9 Belbin roles for realistic team dynamics
-
-### 13. Hive-Mind Coordination (`web/.deepseek/`)
-
-Sub-agent coordination system for parallel development workflows:
-
-- **Build mutex** — File-based lock prevents concurrent builds from corrupting `.next/`
-- **Shared state** — `AGENT-STATE.json` task board visible to all agents
-- **Turn log** — `TURN-LOG.md` append-only action log for agent coordination
-- **Chunking strategy** — 400-line file chunking for sub-agents to avoid API timeouts
-- **Configuration** — `config.toml` with sub-agent timeout (600s), chunking, and hive-mind settings
 
 ---
 
