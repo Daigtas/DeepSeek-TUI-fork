@@ -1,11 +1,13 @@
 # DeepSeek TUI (Fork)
 
-> AI-powered development platform with **daemon mode**, **swarm orchestration**, **web UI**, **agency engine**, **session persistence**, and **hybrid context storage** — built on DeepSeek V4.
+> AI-powered development platform with **rich terminal UI**, **daemon mode**, **swarm orchestration**, **real-time streaming**, **mid-execution pushback**, **session persistence**, and **hybrid context storage** — built on DeepSeek V4.
 
 This fork of [DeepSeek TUI](https://github.com/DeepSeek-TUI/DeepSeek-TUI) adds:
+- **Rich TUI** — Ratatui-based multi-pane terminal: Chat, Diff, Tasks, Agents, Jobs with keyboard switching
+- **Mid-Execution Pushback** — Type corrections while the agent works; auto-sends on period (.) or Enter
+- **Real-Time Streaming** — Tool calls and text deltas stream via hooks as they happen
+- **Session Persistence** — Auto-save on Ctrl+C, auto-resume on next `deepseek tui`
 - **Web UI** — Next.js 16 browser interface with multi-mode agent chat, streaming, and session management
-- **Agency Engine** — 11-role development agency hierarchy with 72 team members, sprint system, and task routing
-- **Hive-Mind** — Sub-agent coordination with build mutex, shared state, and chunking strategy
 - **Daemon mode** — Long-lived background agent with HTTP API, swarm coordination, and persistent sessions
 - **Swarm orchestration** — Multi-agent task decomposition with DAG-based scheduling
 - **Hybrid context** — SQLite + in-memory cache with full-text search
@@ -16,144 +18,82 @@ All upstream functionality remains intact.
 
 ## What's Different from Upstream
 
-### 1. Daemon Mode (`deepseek serve --daemon`)
+### 1. Rich Ratatui TUI (`deepseek tui`)
 
-The original DeepSeek TUI runs as an interactive terminal application. This fork adds a production-grade daemon mode:
+A complete desktop-grade terminal interface replacing the upstream raw-echo TUI:
 
-- **`deepseek serve --daemon`** — Forks to background, detaches from terminal, and serves an HTTP API
-- **PID file support** — `--pid-file /var/run/deepseek.pid` for process supervision (systemd, launchd)
-- **Auto-shutdown** — `--auto-shutdown-idle` with configurable `--idle-timeout-secs` (default 300s)
-- **`deepseek status`** — Dashboard showing connected clients, active tasks, swarm agents, and uptime
-- **`deepseek version`** — Prints version and exits
-- **`deepseek stdio`** — JSON-RPC over stdin/stdout for IDE/editor integration
-- **Daemon detection** — Running `deepseek serve` when a daemon is already active shows the dashboard instead of starting a duplicate
-- **systemd service file** — Ships with `deepseek.service` for one-command deployment on Linux
+```
+┌─ 1:Chat ─── 2:Diff ──── 3:Tasks ─── 4:Agents ─── 5:Jobs ──┐
+│                                                           │
+│  You add dark mode to settings page                       │
+│  DS Here's the implementation plan...                     │
+│  🔧 running read_file                                     │
+│  ✅ completed write_file                                  │
+│  DS ▌streaming text appears here...                       │
+│                                                           │
+│  ❯ type a message…                                       │
+├───────────────────────────────────────────────────────────┤
+│ ● STREAMING  🤖 Agent  deepseek-v4-pro  ctx 87% (12K) 5r │
+└───────────────────────────────────────────────────────────┘
+```
 
-### 2. Swarm Orchestration (`deepseek-swarm` crate)
+- **Chat pane** (key `1`) — Scrollable message history, role-colored messages (You/DS/Tool), input bar with streaming indicator
+- **Diff pane** (key `2`) — Git diff with syntax coloring (yellow headers, green/red ± lines), file stats
+- **Tasks pane** (key `3`) — GSD task list from `.planning/` ROADMAP.md and STATE.md, status icons
+- **Agents pane** (key `4`) — Active swarm agents with status (idle/working/done/failed), periodic 3s poll
+- **Jobs pane** (key `5`) — Reserved for background job tracking
+- **PaneBar** — Tab bar at top with keyboard shortcut hints, active pane highlighted
+- **Status bar** — Context budget gauge, agent mode, model name, round count, streaming indicator
+- **Keyboard navigation** — `1`-`5` switch panes, `Up/Down` scroll, `PgUp/PgDown` fast scroll, `Enter` submit or switch to Chat
+- Built on **ratatui** + **crossterm** with alternate screen and mouse support
 
-Multi-agent coordination with a shared knowledge store:
+### 2. Mid-Execution Pushback (Claude Code Parity)
 
-- **Hive Mind** — Thread-safe, versioned key-value store shared across all agents. Supports pub/sub notifications, namespace isolation (`agent.*`, `finding.*`, `decision.*`, `task.*`), and full snapshots for new agent initialization
-- **Swarm Orchestrator** — Spawns, assigns tasks to, and coordinates multiple specialized agents concurrently
-- **Agent Roles** — Explorer (read-only), Implementer, Reviewer, Tester, Planner, Coordinator, General — each with appropriate tool restrictions
-- **Task Graph** — DAG-based task decomposition with dependency resolution, parallel scheduling, and progress tracking
-- **Objective Decomposition** — `SwarmOrchestrator::decompose_objective("add dark mode support")` auto-generates a 5-node task graph (explore → design → implement → review → test)
-- **Hive Persistence** — `checkpoint_hive()` / `restore_from_store()` save and restore swarm state across daemon restarts
+The agent is never "unavailable" — type corrections anytime and the agent rethinks mid-stream:
 
-### 3. Hybrid Context Store (`deepseek-context` crate)
+- **Cancellable prompt execution** — `handle_prompt` wrapped in `tokio::spawn` with abort support via oneshot channel bridge. When the user sends a correction, the in-progress API call is cancelled and the prompt restarts with the correction merged.
+- **Continuous auto-pushback** — During execution, typing a period (`.`) auto-sends the accumulated input as a correction. No Enter required. A subtle `↻` indicator appears in the terminal.
+- **Persistent prompt state** — The background processor keeps the active prompt text across retries. Pushbacks merge cleanly into the original prompt with `[USER CORRECTION]` framing.
+- **Race-based architecture** — `tokio::select!` races spawned `handle_prompt` against the pushback channel. On pushback arrival: abort, merge, re-spawn. This replaces the old design where pushbacks were only checked between prompts (never during execution).
 
-SQLite-backed persistent context with in-memory hot cache:
+```
+User types "add dark mode"         → Agent starts working
+User types "use system pref".      → Auto-sends correction
+Agent aborts current work          → Merges correction
+Agent restarts with merged prompt  → "add dark mode\n\n[USER CORRECTION]: use system pref"
+```
 
-- **Conversation turns** — Full turn storage with reasoning blocks, model info, tool calls, and tags
-- **Context entries** — Snippets, links, decisions, file references, workspace state, images
-- **Full-text search** — `search_turns("SQLite", 5)` across all stored conversations
-- **Hybrid context builder** — `build_hybrid_context()` assembles a token-budgeted context window from recent turns, decisions, workspace state, and search results
-- **Batch operations** — `insert_turns_batch()` for efficient bulk storage
-- **Tag-based search** — `search_by_tags(["rust", "example"], 10)`
+### 3. Real-Time Streaming via Hooks
 
-### 4. Session Persistence (`deepseek-session` crate)
+Text deltas and tool lifecycles stream to the terminal in real-time, not just after completion:
 
-Full session lifecycle management:
+- **ChannelHookSink** — Implements the `deepseek-hooks` `HookSink` trait, piping `HookEvent` values through an unbounded mpsc channel to the TUI render loop
+- **ResponseDelta** events append text character-by-character to the chat pane
+- **ToolLifecycle** events show `🔧 running read_file` / `✅ completed write_file` as tools execute
+- **ResponseEnd** flushes the streaming buffer to a permanent message
+- Integrated into `build_state()` via optional `UnboundedSender<HookEvent>` parameter — only active in `run_tui_rich`, transparent to daemon and stdio modes
 
-- **Save/resume** — Sessions persist across daemon restarts with `SessionStore`
-- **Export/import** — `.ds-session` archive format (tar.gz) with manifest + turns, validation on import
-- **Cross-device resume** — Export on one machine, import on another
-- **Session builder** — `SessionBuilder` fluent API for constructing sessions programmatically
-- **Search and filter** — `search("rust")`, `list_by_workspace("/path")`, tag filtering
-- **Archive validation** — `validate_archive()` checks header, manifest, turns, and structure integrity
+### 4. Session Persistence
 
-### 5. Planning System (`deepseek-planning` crate)
+Full session lifecycle with checkpoint/restore:
 
-Structured development workflow based on the GSD (Getting Stuff Done) methodology:
+- **Auto-save on exit** — `Ctrl+C` and `/exit` capture a `Checkpoint` snapshot (input buffer, thread ID, pending tasks) to `~/.deepseek/tui_checkpoint.json`
+- **Auto-resume on start** — `deepseek tui` detects the checkpoint file, displays a prompt ("Press 'r' to resume, any key to skip"), and restores the session
+- **`/save` command** — Manual save at any time
+- Checkpoint format includes `UiState` snapshot with timestamp, description, and tags
 
-- **Project manifest** — PROJECT.md with vision, constraints, decisions
-- **Requirements** — REQ-001 style tracking with status (Proposed/Accepted/Implemented/Deferred) and priorities
-- **Roadmap** — Phases with dependencies, status tracking, and plan estimates
-- **Phase pipeline** — State machine that routes: Discuss → Plan → Execute → Verify → Ship
-- **Plan files** — Per-phase PLAN.md with tasks, effort estimates, and agent assignment
-- **Project state** — STATE.md with blockers, decisions, and metrics
+### 5. Slash Commands
 
-### 6. Plugin System (`deepseek-plugins` crate)
+Built-in slash commands accessible from the chat input:
 
-Composable skill and plugin management:
-
-- **Skill loader** — Parses SKILL.md files with YAML frontmatter (name, description, category, allowed_tools)
-- **Plugin registry** — Discovers plugins from disk, manages enable/disable state
-- **Skill search** — `search_skills("phase")` finds relevant skills by name/description
-- **Install/uninstall** — Plugin manifests with versioning, dependencies, and skill lists
-- **Categories** — Workflow, Quality, Context, Manage, Ideate, Custom
-
-### 7. Enhanced TUI Core (`deepseek-tui-core` crate)
-
-Extended the original event system with production features:
-
-- **Context budget tracking** — `ContextBudget` with warning/critical thresholds, ASCII gauge bar rendering (`[████▓▓░░░░] 65%`)
-- **Bracketed paste support** — `BracketedPasteBuffer` handles terminal paste sequences (`\e[200~` … `\e[201~`) with multi-line paste detection
-- **Paste content detection** — Auto-detects text, code (with language), URLs, images, or mixed content
-- **Extended UI events** — 20+ new event types: `PasteStart`, `PasteEnd`, `PasteContent`, `ContextWarning`, `ContextCritical`, `TabPressed`, `SlashCommand`, `AgentSpawned`, `AgentCompleted`, `AgentErrored`, `AgentHeartbeat`, `CaptureCheckpoint`, `RestoreCheckpoint`, etc.
-- **Slash command system** — `/help`, `/model`, `/compact`, `/restore`, `/checkpoint`, `/agents`, `/hive`, `/sessions`, `/progress`, `/resume` with completion and popup UI
-- **Path autocompletion** — Tab-triggered file/directory completion in the composer
-- **Checkpoint system** — Named snapshots of session state for save/restore
-- **Stack-allocated effects** — `EffectVec` uses `SmallVec<[UiEffect; 4]>` to avoid heap allocation for common effect chains
-
-### 8. Enhanced Tools (`deepseek-tools` crate)
-
-- **Tool execution metrics** — Per-tool success/failure/timeout/retry tracking with average duration and success rate
-- **Retry policy** — Configurable `RetryPolicy` with max retries, exponential backoff, and timeout handling
-- **Parallel execution** — `ToolCallRuntime::with_max_parallel(n)` with semaphore-based concurrency control
-- **Metrics snapshots** — `metrics_snapshot()` returns aggregated stats across all tools
-
-### 9. Enhanced Agent Registry (`deepseek-agent` crate)
-
-- **Model lifecycle** — `add_model()`, `remove_model()`, `deprecate_model()`, `undeprecate_model()`
-- **Stable IDs** — Each model gets a persistent stable identifier for reliable references
-- **Provider filtering** — `filter_by_provider(ProviderKind::DeepSeek)`
-- **Capability filtering** — `filter_by_capabilities(Capabilities { reasoning: true, .. })`
-- **Active models** — `active_models()` returns non-deprecated entries only
-
-### 10. Web UI (`web/` directory)
-
-A full Next.js 16 web application providing a browser-based interface to the TUI daemon:
-
-- **Multi-mode agent** — Agent, Plan, YOLO, and Agency modes with configurable system prompts
-- **Real-time streaming** — Server-Sent Events streaming with tool call visualization and mid-task interruption
-- **Session management** — Create, rename, delete, and search chat sessions with server-side persistence
-- **WebSocket backend** — `ws-server.ts` handles chat streams and disconnection recovery via daemonized tasks
-- **Settings system** — Model selection, context limits, theme switching, and hook configuration
-- **Mobile-first design** — Safe area insets, 44px touch targets, responsive breakpoints, WCAG AA accessibility
-- **ChatSkeleton** — Shimmer loading placeholders for chat session loading
-- **Slash commands** — `/help`, `/model`, `/compact`, `/agents`, `/hive`, `/sessions`, `/progress`
-
-### 11. Agency Engine (`web/src/lib/agency/`)
-
-Complete web development agency simulation with hierarchical delegation, inspired by real agency structures (DECODE Pod model, Spotify Squad/Tribe, Netguru):
-
-- **11 roles across 4 levels** — Leadership (CEO, CTO), Management (PM, Tech Lead), Execution (Senior/Mid/Junior Dev), Specialists (Designer, QA, DevOps, Security)
-- **72 team members** — Each with real names, personality traits, Belbin team roles, catchphrases, bios, and emoji avatars
-- **Task routing** — Automatic role assignment based on task keywords (audit→Security, design→Designer, deploy→DevOps)
-- **Sprint system** — 2-week sprints with backlog management, burndown charts, and Scrum ceremonies (standup, planning, review, retrospective)
-- **Quality gates** — Role-based approval authority, review requirements, and delegation rules
-- **Personality system** — 16 personality traits combined with 9 Belbin roles for realistic team dynamics
-
-### 12. Hive-Mind Coordination (`web/.deepseek/`)
-
-Sub-agent coordination system for parallel development workflows:
-
-- **Build mutex** — File-based lock prevents concurrent builds from corrupting `.next/`
-- **Shared state** — `AGENT-STATE.json` task board visible to all agents
-- **Turn log** — `TURN-LOG.md` append-only action log for agent coordination
-- **Chunking strategy** — 400-line file chunking for sub-agents to avoid API timeouts (120s→600s)
-- **Build orchestrator** — `scripts/build-orchestrator.sh` serializes agent builds via mutex
-- **Configuration** — `config.toml` with sub-agent timeout, chunking, and hive-mind settings
-
-### 13. App Server Upgrades (`deepseek-app-server`)
-
-- **Daemon state** — Tracks connected clients, detached mode, active task count, and uptime
-- **Daemon API endpoints** — `/healthz`, `/daemon/status`, `/daemon/resume`, `/daemon/progress`
-- **Swarm endpoints** — `/swarm/agents`, `/hive/summary`
-- **Terminal input module** — Raw mode management with bracketed paste, `TerminalInput` wrapping stdin
-- **Daemon supervisor** — Progress logging, agent lifecycle tracking, resume suggestions, hive checkpoint/restore
-- **Session integration** — Session store wired into the HTTP API for list/resume/export
+| Command | Action |
+|---------|--------|
+| `/diff` | Load git diff output → switches to Diff pane |
+| `/tasks` | Load GSD tasks from `.planning/` → switches to Tasks pane |
+| `/swarm` | Refresh agent list from swarm orchestrator → switches to Agents pane |
+| `/save` | Manual session save |
+| `/clear` | Clear conversation and reset thread |
+| `/exit` | Clean exit with auto-save |
 
 ---
 
@@ -161,6 +101,15 @@ Sub-agent coordination system for parallel development workflows:
 
 ```
 deepseek (CLI dispatcher)
+  ├─ deepseek tui              → ratatui TUI (rich multi-pane)
+  │   ├─ TuiApp                → Chat, Diff, Tasks, Agents panes
+  │   ├─ background processor  → cancellable prompt execution
+  │   │   ├─ pushback channel  → mid-execution corrections
+  │   │   └─ oneshot bridge   → abort + re-spawn on pushback
+  │   ├─ stream_rx channel     → real-time hook events
+  │   │   └─ ChannelHookSink   → pipes HookEvent to TUI
+  │   ├─ agents_rx channel     → periodic swarm status poll
+  │   └─ output_rx channel     → background task results
   ├─ deepseek serve --daemon   → app-server (HTTP API)
   │   ├─ supervisor            → progress logging, resume suggestions
   │   ├─ terminal              → raw mode, bracketed paste
@@ -177,24 +126,56 @@ deepseek (CLI dispatcher)
 
 ---
 
-## New Crate Map
+## Crate Map
 
 | Crate | Purpose | LOC |
 |---|---|---|
-| `deepseek` | CLI dispatcher with daemon, status, version, stdio commands | 209 |
-| `deepseek-app-server` | HTTP API with daemon mode, supervisor, terminal input | 1,118 |
+| `deepseek` | CLI dispatcher with daemon, status, version, stdio commands | 218 |
+| `deepseek-app-server` | HTTP API + ratatui TUI + cancellable pushback + streaming hooks | 1,474 |
 | `deepseek-context` | SQLite-backed hybrid context store | 1,469 |
 | `deepseek-planning` | GSD planning system (phases, plans, requirements) | 587 |
 | `deepseek-plugins` | Plugin registry and skill loader | 533 |
 | `deepseek-session` | Persistent sessions with export/import | 890 |
 | `deepseek-swarm` | Swarm orchestration with hive mind and task graph | 1,521 |
-| `deepseek-tui-core` | Extended TUI events, context budget, bracketed paste | 2,884 |
+| `deepseek-tui-core` | Extended TUI events, context budget, bracketed paste, checkpoint | 2,884 |
 | `deepseek-tools` | Tool metrics, retry policy, parallel execution | 870 |
 | `deepseek-agent` | Model registry with lifecycle management | 865 |
+
+**TUI widget module** (`crates/app-server/src/tui/`):
+
+| Widget | Purpose | LOC |
+|---|---|---|
+| `app.rs` | TuiApp struct, pane switching, render orchestration | 116 |
+| `widgets/chat.rs` | Chat pane with messages, input bar, streaming | 169 |
+| `widgets/diff.rs` | Git diff parser and syntax-highlighted renderer | 89 |
+| `widgets/tasks.rs` | GSD task list with status icons and stats | 114 |
+| `widgets/agents.rs` | Swarm agent status display | 84 |
+| `widgets/pane_bar.rs` | Tab bar with keyboard shortcuts | 45 |
+| `widgets/status.rs` | Status bar with context gauge | 85 |
+
+---
+
+## Web UI
+
+A full Next.js 15 web application providing a browser-based interface:
+
+- **Multi-mode agent** — Agent, Plan, YOLO, and **Agency** modes with configurable system prompts
+- **Agency Engine** — 11-role development agency hierarchy (CEO, CTO, PM, Tech Lead, Senior/Mid/Junior Dev, Designer, QA, DevOps, Security) with 72 team members, Belbin roles, and sprint system
+- **Real-time streaming** — SSE streaming with tool call visualization and mid-task interruption
+- **Session management** — Create, rename, delete, and search chat sessions with server-side persistence
+- **Mobile-first design** — Responsive, WCAG AA accessible, 44px touch targets
 
 ---
 
 ## Install
+
+### Download Binary (Linux x86_64)
+
+```bash
+curl -L https://github.com/Daigtas/DeepSeek-TUI-fork/releases/latest/download/deepseek -o ~/bin/deepseek
+chmod +x ~/bin/deepseek
+~/bin/deepseek version
+```
 
 ### From Source
 
@@ -202,9 +183,8 @@ deepseek (CLI dispatcher)
 git clone https://github.com/Daigtas/DeepSeek-TUI-fork.git
 cd DeepSeek-TUI-fork
 cargo build --release
+# Binary at target/release/deepseek
 ```
-
-The binary is at `target/release/deepseek`.
 
 ### Web UI Setup
 
@@ -213,16 +193,6 @@ cd web
 npm install
 npm run build
 npm start        # or: sudo systemctl enable --now deepseek-tui-web
-```
-
-The web UI runs on port 3100 and connects to the daemon's WebSocket endpoint.
-
-### Daemon Setup (systemd)
-
-```bash
-sudo cp deepseek.service /etc/systemd/system/
-sudo systemctl daemon-reload
-sudo systemctl enable --now deepseek
 ```
 
 ### API Endpoints
@@ -240,7 +210,7 @@ sudo systemctl enable --now deepseek
 
 ## Upstream Compatibility
 
-This fork is fully compatible with the upstream DeepSeek TUI. It adds backend infrastructure without removing or breaking any existing functionality. The TUI frontend, model integration, tool suite, and configuration system remain identical to upstream.
+This fork is fully compatible with the upstream DeepSeek TUI. It adds a rich terminal UI, mid-execution pushback, real-time streaming, and session persistence without removing or breaking any existing functionality. The daemon, stdio, model integration, tool suite, and configuration system remain identical to upstream.
 
 ---
 
