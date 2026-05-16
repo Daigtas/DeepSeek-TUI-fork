@@ -3,7 +3,7 @@ use std::path::PathBuf;
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
-use deepseek_app_server::{AppServerOptions, run, run_stdio, run_tui};
+use deepseek_app_server::{AppServerOptions, run, run_stdio, run_tui_rich};
 
 /// DeepSeek TUI — AI-powered terminal workspace
 #[derive(Debug, Parser)]
@@ -93,21 +93,20 @@ fn print_dashboard(host: &str, port: u16) {
     }
 
     // Resume suggestion
-    if let Ok(resp) = reqwest::blocking::get(format!("{base}/daemon/resume")) {
-        if let Ok(body) = resp.json::<serde_json::Value>() {
-            if let Some(resume) = body.get("resume") {
-                let action = resume.get("suggested_action").and_then(|v| v.as_str()).unwrap_or("idle");
-                let summary = resume.get("summary").and_then(|v| v.as_str()).unwrap_or("");
-                let agents = resume.get("active_agents").and_then(|v| v.as_array()).map(|a| a.len()).unwrap_or(0);
-                println!();
-                println!("  Status:  {summary}");
-                if agents > 0 {
-                    println!("  Agents:  {agents} active");
-                }
-                println!("  Suggestion: /{action}");
-                println!();
-            }
+    if let Ok(resp) = reqwest::blocking::get(format!("{base}/daemon/resume"))
+        && let Ok(body) = resp.json::<serde_json::Value>()
+        && let Some(resume) = body.get("resume")
+    {
+        let action = resume.get("suggested_action").and_then(|v| v.as_str()).unwrap_or("idle");
+        let summary = resume.get("summary").and_then(|v| v.as_str()).unwrap_or("");
+        let agents = resume.get("active_agents").and_then(|v| v.as_array()).map(|a| a.len()).unwrap_or(0);
+        println!();
+        println!("  Status:  {summary}");
+        if agents > 0 {
+            println!("  Agents:  {agents} active");
         }
+        println!("  Suggestion: /{action}");
+        println!();
     }
 
     println!("  Endpoints:");
@@ -192,7 +191,7 @@ fn main() -> Result<()> {
                 .build()
                 .context("failed to build tokio runtime")?;
 
-            rt.block_on(run_tui(cli.config))
+            rt.block_on(run_tui_rich(cli.config))
         }
         Command::Stdio => {
             let rt = tokio::runtime::Builder::new_multi_thread()

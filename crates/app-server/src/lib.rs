@@ -1,26 +1,26 @@
 use std::collections::HashSet;
 use std::fs;
-use std::io::Write;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::process;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result};
 use axum::extract::State;
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
 use axum::response::IntoResponse;
 use axum::routing::{delete, get, post};
 use axum::{Json, Router};
-use futures_util::{SinkExt, StreamExt};
+
 use chrono::Utc;
 use deepseek_agent::ModelRegistry;
 use deepseek_config::{CliRuntimeOverrides, ConfigStore};
 use deepseek_context::HybridContextStore;
 use deepseek_core::Runtime;
 use deepseek_execpolicy::{AskForApproval, ExecPolicyEngine};
-use deepseek_hooks::{HookDispatcher, JsonlHookSink, StdoutHookSink};
+use async_trait::async_trait;
+use deepseek_hooks::{HookDispatcher, HookEvent, HookSink, JsonlHookSink, StdoutHookSink};
 use deepseek_mcp::McpManager;
 use deepseek_protocol::{
     AppRequest, AppResponse, PromptRequest, PromptResponse, ThreadListParams, ThreadRequest,
@@ -30,18 +30,19 @@ use deepseek_session::SessionStore;
 use deepseek_state::StateStore;
 use deepseek_swarm::{AgentRole, AgentSpec, SwarmOrchestrator};
 use deepseek_tools::{ToolCall, ToolRegistry};
-use deepseek_tui_core::UiEvent;
+use deepseek_tui_core::{Checkpoint, EffectVec, UiEffect, UiEvent, UiState};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-use tokio::sync::{RwLock, mpsc};
+use tokio::sync::{RwLock, mpsc, Notify};
 use tower_http::cors::CorsLayer;
 use tracing::{info, warn};
 use uuid::Uuid;
 
 mod terminal;
 mod supervisor;
+pub mod tui;
 
 use supervisor::DaemonSupervisor;
 
@@ -112,6 +113,7 @@ struct AppState {
     session_store: Arc<SessionStore>,
     daemon: Arc<DaemonState>,
     swarm: Arc<SwarmOrchestrator>,
+    #[allow(dead_code)]
     context_store: Arc<HybridContextStore>,
     supervisor: Arc<DaemonSupervisor>,
 }
@@ -159,7 +161,7 @@ pub async fn run(options: AppServerOptions) -> Result<()> {
 async fn run_foreground(options: AppServerOptions) -> Result<()> {
     info!(listen=%options.listen, daemon=options.daemon, "starting");
 
-    let state = build_state(&options)?;
+    let state = build_state(&options, None)?;
 
     // Log startup (hive mind restores lazily on first /daemon/resume call)
     state.supervisor.log("startup", "Daemon started — hive mind will restore on first resume", None).await;
@@ -258,7 +260,7 @@ async fn handle_ws(mut socket: WebSocket) {
     tracing::info!("WebSocket client connected");
     let welcome = serde_json::json!({
         "jsonrpc": "2.0", "method": "connected",
-        "params": {"service": "deepseek-app-server", "version": "0.8.26"}
+        "params": {"service": "deepseek-app-server", "version": env!("CARGO_PKG_VERSION")}
     });
     let _ = socket.send(Message::Text(welcome.to_string().into())).await;
 
@@ -460,7 +462,7 @@ async fn hive_snapshot_handler(State(state): State<AppState>) -> Json<Value> {
 
 pub async fn run_stdio(config_path: Option<PathBuf>) -> Result<()> {
     let opts = AppServerOptions { listen: "127.0.0.1:0".parse().unwrap(), config_path, daemon: false, pid_file: None, auto_shutdown_idle: false, idle_timeout_secs: 300 };
-    let state = build_state(&opts)?;
+    let state = build_state(&opts, None)?;
     let mut reader = BufReader::new(tokio::io::stdin()).lines();
     let mut writer = tokio::io::BufWriter::new(tokio::io::stdout());
     while let Some(line) = reader.next_line().await? {
@@ -501,6 +503,16 @@ pub async fn run_stdio(config_path: Option<PathBuf>) -> Result<()> {
 /// input line to a background task. While processing, you can continue typing
 /// — new input is merged into the active prompt queue and injected on each
 /// tool-use cycle, enabling "rethink and continue" workflows.
+// ── Helper: write to stdout in raw mode ───────────────────────────────────
+macro_rules! echo {
+    ($($arg:tt)*) => {{
+        use std::io::Write;
+        let mut out = std::io::stdout();
+        let _ = write!(out, $($arg)*);
+        let _ = out.flush();
+    }};
+}
+
 pub async fn run_tui(config_path: Option<PathBuf>) -> Result<()> {
     let opts = AppServerOptions {
         listen: "127.0.0.1:0".parse().unwrap(),
@@ -510,173 +522,850 @@ pub async fn run_tui(config_path: Option<PathBuf>) -> Result<()> {
         auto_shutdown_idle: false,
         idle_timeout_secs: 300,
     };
-    let state = build_state(&opts)?;
+    let state = build_state(&opts, None)?;
+    let mut ui_state = UiState::default();
 
     let mut terminal = terminal::TerminalInput::new();
     terminal.enable_raw_mode().context("failed to enable raw terminal mode")?;
 
-    // ── Prompt queue: background channel for submitting prompts ──
+    // ── Channels ──────────────────────────────────────────────────────────
     let (prompt_tx, mut prompt_rx) = mpsc::channel::<(String, Option<String>)>(32);
-    // ── Response channel: background task sends output back to main loop ──
-    let (output_tx, mut output_rx) = mpsc::channel::<(String, bool)>(64); // (text, is_error)
+    let (output_tx, mut output_rx) = mpsc::channel::<(String, bool)>(64);
+    // Mid-execution pushback channel: user types correction while agent works
+    let (pushback_tx, mut pushback_rx) = mpsc::channel::<String>(16);
+    // Async stdin events: blocking thread feeds UiEvents into this channel
+    let (event_tx, mut event_rx) = mpsc::channel::<UiEvent>(64);
 
-    // Spawn the prompt processing background task
-    let bg_state = state.clone();
-    tokio::spawn(async move {
-        while let Some((prompt, thread_id)) = prompt_rx.recv().await {
-            let req = PromptRequest {
-                thread_id,
-                prompt: prompt.clone(),
-                model: None,
-            };
+    // ── Cancellation signal for mid-execution interruption ────────────────
+    let cancel_signal: Arc<Notify> = Arc::new(Notify::new());
 
-            let mut rt = bg_state.runtime.lock().await;
-            match rt.handle_prompt(req, &CliRuntimeOverrides::default()).await {
-                Ok(resp) => {
-                    let _ = output_tx.send((format!("[model: {}]\n{}", resp.model, resp.output), false)).await;
+    // ── Stdin reader thread (blocking read → async channel) ───────────────
+    // Raw-mode stdin doesn't play well with tokio::io::stdin(), so we use a
+    // dedicated blocking thread that feeds UiEvents into an mpsc channel.
+    let mut stdin_terminal = terminal::TerminalInput::new();
+    stdin_terminal.enable_raw_mode().context("failed to enable raw mode in stdin thread")?;
+    let stdin_tx = event_tx.clone();
+    let stdin_shutdown = Arc::new(AtomicBool::new(false));
+    let stdin_shutdown_flag = stdin_shutdown.clone();
+    std::thread::spawn(move || {
+        loop {
+            if stdin_shutdown_flag.load(Ordering::Relaxed) {
+                break;
+            }
+            match stdin_terminal.read_events() {
+                Ok(events) => {
+                    for ev in events {
+                        if stdin_tx.blocking_send(ev).is_err() {
+                            return; // receiver dropped
+                        }
+                    }
                 }
-                Err(e) => {
-                    let _ = output_tx.send((format!("[error: {e}]"), true)).await;
-                }
+                Err(_) => break,
             }
         }
     });
 
+    // ── Background prompt processor with cancellation + pushback support ──
+    // Architecture:
+    //   1. Receives prompt from main event loop (prompt_rx)
+    //   2. Keeps `current_prompt` across retries so pushbacks can merge
+    //   3. Spawns handle_prompt in a cancellable tokio::spawn task
+    //   4. Races the spawned task against pushback_rx — on pushback: abort, merge, re-spawn
+    //   5. On completion: clears current_prompt, waits for next prompt
+    let bg_state = Arc::clone(&state.runtime);
+    tokio::spawn(async move {
+        // Current executing prompt (base text + thread_id) — persists across pushback restarts
+        let mut current_prompt: Option<(String, Option<String>)> = None;
+        // Handle to cancellable spawned handle_prompt task (kept outside select! for abort access)
+        let mut spawn_handle: Option<tokio::task::JoinHandle<()>>;
+        // Pushbacks accumulated between checks
+        let mut accumulated_pushbacks: Vec<String> = Vec::new();
+
+        loop {
+            // ── Step 1: Drain any pushbacks that arrived since last iteration ──
+            while let Ok(pb) = pushback_rx.try_recv() {
+                accumulated_pushbacks.push(pb);
+            }
+
+            // ── Step 2: Determine the prompt to execute ──
+            // If we have pushbacks for the current prompt, restart it with corrections.
+            // Otherwise, wait for a new prompt from the user.
+            let (mut prompt, thread_id) = if let Some((ref base_prompt, ref tid)) = current_prompt {
+                if accumulated_pushbacks.is_empty() {
+                    // No pushbacks — wait for a fresh prompt from main loop
+                    match prompt_rx.recv().await {
+                        Some(p) => {
+                            current_prompt = Some((p.0.clone(), p.1.clone()));
+                            p
+                        }
+                        None => break,
+                    }
+                } else {
+                    // Pushbacks arrived — merge into current prompt and retry
+                    let pb_text = accumulated_pushbacks.join("\n");
+                    accumulated_pushbacks.clear();
+                    let merged = merge_prompt_with_pushbacks(base_prompt.clone(), &[pb_text]);
+                    (merged, tid.clone())
+                }
+            } else {
+                match prompt_rx.recv().await {
+                    Some(p) => {
+                        current_prompt = Some((p.0.clone(), p.1.clone()));
+                        p
+                    }
+                    None => break,
+                }
+            };
+
+            // ── Step 3: Drain pushbacks that arrived during recv ──
+            while let Ok(pb) = pushback_rx.try_recv() {
+                accumulated_pushbacks.push(pb);
+            }
+
+            // Merge any pushbacks that arrived before we start executing
+            if !accumulated_pushbacks.is_empty() {
+                let pb_text = accumulated_pushbacks.join("\n");
+                accumulated_pushbacks.clear();
+                prompt = merge_prompt_with_pushbacks(prompt, &[pb_text]);
+            }
+
+            let _ = output_tx.send(("\r\x1b[K⏳ thinking…".to_string(), false)).await;
+
+            // ── Step 4: Spawn handle_prompt in a cancellable task ──
+            // This is the critical change: instead of calling handle_prompt inline
+            // (which blocks the processor for minutes), we spawn it so we can abort
+            // it when the user sends a correction.
+            let req = PromptRequest {
+                thread_id: thread_id.clone(),
+                prompt: prompt.clone(),
+                model: None,
+            };
+            let rt_clone = Arc::clone(&bg_state);
+            let output_clone = output_tx.clone();
+
+            // ── Bridge: oneshot channel to receive result without moving JoinHandle ──
+            // Using oneshot lets us keep spawn_handle accessible in the pushback branch
+            // for abort(), since tokio::select! would move a direct JoinHandle.
+            let (done_tx, mut done_rx) = tokio::sync::oneshot::channel();
+            spawn_handle = Some(tokio::spawn(async move {
+                let mut rt = rt_clone.lock().await;
+                let result = rt.handle_prompt(req, &CliRuntimeOverrides::default()).await;
+                // Send result through oneshot — ignore error if receiver dropped (aborted)
+                let _ = done_tx.send(result);
+            }));
+
+            // ── Step 5: Race — prompt completion vs pushback arrival ──
+            let completed = tokio::select! {
+                // Prompt finished normally (or errored)
+                result = (&mut done_rx) => {
+                    match result {
+                        Ok(Ok(resp)) => {
+                            let _ = output_clone.send((
+                                format!("\r\x1b[K[model: {}]\n{}", resp.model, resp.output),
+                                false,
+                            )).await;
+                        }
+                        Ok(Err(e)) => {
+                            let _ = output_clone.send((
+                                format!("\r\x1b[K[error: {e}]"), true,
+                            )).await;
+                        }
+                        Err(_recv_err) => {
+                            // oneshot sender was dropped — task was aborted or panicked
+                            let _ = output_clone.send((
+                                "\r\x1b[K[agent task cancelled or panicked]".to_string(),
+                                true,
+                            )).await;
+                        }
+                    }
+                    true // completed
+                }
+                // Pushback arrived mid-execution — abort the agent and rethink
+                pb = pushback_rx.recv() => {
+                    if let Some(pb_text) = pb {
+                        accumulated_pushbacks.push(pb_text);
+                    }
+                    // Abort the in-progress handle_prompt — this drops the future,
+                    // releases the runtime mutex, and cancels any in-flight HTTP requests
+                    if let Some(h) = spawn_handle.take() {
+                        h.abort();
+                    }
+                    let _ = output_clone.send((
+                        "\r\x1b[K[correction received — rethinking…]".to_string(),
+                        false,
+                    )).await;
+                    false // not completed — will loop and retry with merged prompt
+                }
+            };
+
+            if completed {
+                // Prompt finished — clear current_prompt so next iteration waits for fresh input
+                current_prompt = None;
+            }
+            // If !completed, current_prompt stays set — next iteration merges and retries
+        }
+    });
+
+    // ── Welcome banner ────────────────────────────────────────────────────
     eprintln!("╔══════════════════════════════════════════╗");
     eprintln!("║        DeepSeek TUI v{}               ║", env!("CARGO_PKG_VERSION"));
     eprintln!("╠══════════════════════════════════════════╣");
     eprintln!("║  Type a prompt and press Enter.          ║");
     eprintln!("║  Paste with Ctrl+V or Shift+Insert.      ║");
-    eprintln!("║  Type /help for commands.  Ctrl+C exit.  ║");
+    eprintln!("║  Mid-exec: type corrections anytime.     ║");
+    eprintln!("║  Auto-sends on period (.) or Enter.      ║");
+    eprintln!("║  /save to persist.  /help for commands.  ║");
+    eprintln!("║  Ctrl+C to exit (auto-saves session).    ║");
     eprintln!("╚══════════════════════════════════════════╝");
     eprintln!();
 
-    let mut input_line = String::new();
     let mut thread_id: Option<String> = None;
-    let mut active_prompts: usize = 0;
 
-    // Helper: write to stdout in raw mode
-    macro_rules! echo {
-        ($($arg:tt)*) => {{
-            use std::io::Write;
-            let mut out = std::io::stdout();
-            let _ = write!(out, $($arg)*);
-            let _ = out.flush();
-        }};
+    // ── Session auto-resume ───────────────────────────────────────────────
+    // Check for a saved checkpoint from a previous session (Claude Code parity)
+    let home = std::env::var("HOME")
+        .or_else(|_| std::env::var("USERPROFILE"))
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| PathBuf::from("."));
+    let checkpoint_path = home.join(".deepseek").join("tui_checkpoint.json");
+    if checkpoint_path.exists() {
+        if let Ok(data) = std::fs::read_to_string(&checkpoint_path) {
+            if let Ok(cp) = serde_json::from_str::<Checkpoint>(&data) {
+                echo!("\r\n╔══════════════════════════════════════════╗\r\n");
+                echo!("║  Previous session found:                 ║\r\n");
+                echo!("║  {}  ║\r\n", cp.display());
+                echo!("║  Press 'r' to resume, any key to skip    ║\r\n");
+                echo!("╚══════════════════════════════════════════╝\r\n");
+                // Read a single key
+                if let Ok(events) = terminal.read_events() {
+                    if let Some(UiEvent::KeyPressed('r')) = events.first() {
+                        cp.restore(&mut ui_state);
+                        thread_id = cp.tags.first().cloned();
+                        echo!("[session resumed]\r\n\r\n");
+                    } else {
+                        echo!("[starting fresh]\r\n\r\n");
+                    }
+                }
+                // Remove checkpoint after attempt (resume or skip)
+                let _ = std::fs::remove_file(&checkpoint_path);
+            }
+        }
     }
 
-    // ── Main event loop: interleave stdin reads with output processing ──
+    // ── Main async event loop ─────────────────────────────────────────────
     loop {
-        // Drain any pending output from background tasks (non-blocking)
-        while let Ok((text, is_error)) = output_rx.try_recv() {
-            active_prompts = active_prompts.saturating_sub(1);
-            if is_error {
-                echo!("\r\x1b[K"); // clear current line
-                eprintln!("{}", text);
-            } else {
-                echo!("\r\x1b[K"); // clear the "thinking…" or input line
-                println!("{}", text);
-            }
-            println!();
-        }
+        tokio::select! {
+            // ── Incoming UI events from stdin ──────────────────────────
+            maybe_event = event_rx.recv() => {
+                let Some(event) = maybe_event else { return Ok(()); };
 
-        // Read stdin events (blocking, but interrupted by output above)
-        let events = match terminal.read_events() {
-            Ok(ev) => ev,
-            Err(e) => {
-                echo!("\r\n[input error: {e}]\r\n");
-                break Ok(());
-            }
-        };
+                // ── Capture prompt text BEFORE reduce clears the buffer ──
+                let prompt_before = if matches!(event, UiEvent::EnterPressed) {
+                    Some(ui_state.input_buffer.trim().to_string())
+                } else {
+                    None
+                };
 
-        for event in events {
-            match event {
-                UiEvent::KeyPressed(ch) => {
-                    if ch == '\x03' || ch == '\x04' {
-                        echo!("\r\nexiting.\r\n");
-                        let _ = terminal.disable_raw_mode();
-                        return Ok(());
-                    }
-                    if ch == '\x7f' || ch == '\x08' {
-                        if !input_line.is_empty() {
-                            input_line.pop();
-                            echo!("\x08 \x08");
+                let effects = ui_state.reduce(event.clone());
+                process_effects(&effects, &mut ui_state);
+
+                // ── Handle key events (echo + special keys) ──────────────
+                match event {
+                    UiEvent::KeyPressed(ch) => {
+                        match ch {
+                            '\x03' | '\x04' => {
+                                echo!("\r\nexiting.\r\n");
+                                // Auto-save session checkpoint before exit (Claude Code parity)
+                                let cp = Checkpoint::capture(&ui_state, "auto-save", Some("autosave on exit"));
+                                if let Some(ref tid) = thread_id {
+                                    let mut cp_with_tag = cp;
+                                    cp_with_tag.tags.push(tid.clone());
+                                    if let Ok(json) = serde_json::to_string(&cp_with_tag) {
+                                        let _ = std::fs::write(&checkpoint_path, json);
+                                    }
+                                } else {
+                                    if let Ok(json) = serde_json::to_string(&cp) {
+                                        let _ = std::fs::write(&checkpoint_path, json);
+                                    }
+                                }
+                                stdin_shutdown.store(true, Ordering::Relaxed);
+                                let _ = terminal.disable_raw_mode();
+                                return Ok(());
+                            }
+                            '\x7f' | '\x08' => {
+                                // Backspace: reduce already pushed the char; undo it
+                                if !ui_state.input_buffer.is_empty() {
+                                    ui_state.input_buffer.pop();
+                                    echo!("\x08 \x08");
+                                }
+                            }
+                            '\t' => {
+                                echo!("[tab]");
+                                // Undo tab char pushed by reduce
+                                if ui_state.input_buffer.ends_with('\t') {
+                                    ui_state.input_buffer.pop();
+                                }
+                            }
+                            _ => {
+                                // Echo printable characters in raw mode
+                                if ch.is_ascii_graphic() || ch == ' ' {
+                                    let mut buf = [0u8; 4];
+                                    let s = ch.encode_utf8(&mut buf);
+                                    echo!("{}", s);
+                                }
+                                // Auto-pushback: during execution, send correction on sentence boundaries
+                                // without requiring Enter. Claude Code-style continuous feedback.
+                                if ui_state.pending_tasks > 0 && ch == '.' {
+                                    let trimmed = ui_state.input_buffer.trim();
+                                    if !trimmed.is_empty() && trimmed.len() > 3 {
+                                        let correction = trimmed.to_string();
+                                        // Non-blocking send — channel has capacity 16
+                                        let _ = pushback_tx.try_send(correction);
+                                        echo!(" \x1b[33m↻\x1b[0m");
+                                    }
+                                }
+                            }
                         }
-                        continue;
                     }
-                    if ch == '\t' {
-                        // Tab completion placeholder
-                        echo!("[tab]");
-                        continue;
-                    }
-                    if ch.is_ascii_graphic() || ch == ' ' {
-                        input_line.push(ch);
-                        let mut buf = [0u8; 4];
-                        let s = ch.encode_utf8(&mut buf);
-                        echo!("{}", s);
-                    }
-                }
-                UiEvent::EnterPressed => {
-                    let prompt = input_line.trim().to_string();
-                    echo!("\r\n"); // newline after input
-                    input_line.clear();
-
-                    if prompt.is_empty() {
-                        continue;
-                    }
-
-                    // Local slash commands
-                    if prompt == "/exit" || prompt == "/quit" || prompt == "/q" {
-                        echo!("exiting.\r\n");
-                        let _ = terminal.disable_raw_mode();
-                        return Ok(());
-                    }
-                    if prompt == "/clear" {
-                        thread_id = None;
-                        echo!("[conversation cleared]\r\n\r\n");
-                        continue;
-                    }
-                    if prompt == "/status" {
-                        echo!("thread: {} | queued: {}\r\n\r\n",
-                            thread_id.as_deref().unwrap_or("none"), active_prompts);
-                        continue;
-                    }
-                    if prompt == "/help" {
-                        echo!("/exit /quit /q — exit\r\n");
-                        echo!("/clear — clear conversation\r\n");
-                        echo!("/status — show status\r\n");
-                        echo!("/paste — test paste detection\r\n");
+                    UiEvent::EnterPressed => {
+                        let prompt = prompt_before.unwrap_or_default();
+                        if prompt.is_empty() {
+                            continue;
+                        }
                         echo!("\r\n");
-                        continue;
-                    }
-                    if prompt == "/paste" {
-                        echo!("[paste detection active — try Ctrl+V, Shift+Insert, or middle-click]\r\n\r\n");
-                        continue;
-                    }
 
-                    // Submit to background prompt processor
-                    let tid = thread_id.clone();
-                    if let Err(_) = prompt_tx.send((prompt.clone(), tid)).await {
-                        echo!("[error: prompt queue full]\r\n\r\n");
-                        continue;
+                        // ── Local slash commands ────────────────────────
+                        match prompt.as_str() {
+                            "/save" => {
+                                let cp = Checkpoint::capture(&ui_state, "manual-save", Some("user-requested save"));
+                                let mut cp_with_tag = cp;
+                                if let Some(ref tid) = thread_id {
+                                    cp_with_tag.tags.push(tid.clone());
+                                }
+                                if let Ok(json) = serde_json::to_string(&cp_with_tag) {
+                                    if let Err(e) = std::fs::write(&checkpoint_path, json) {
+                                        echo!("[save failed: {e}]\r\n\r\n");
+                                    } else {
+                                        echo!("[session saved — resume with 'deepseek tui']\r\n\r\n");
+                                    }
+                                }
+                                continue;
+                            }
+                            "/exit" | "/quit" | "/q" => {
+                                echo!("exiting.\r\n");
+                                // Auto-save on clean exit
+                                let cp = Checkpoint::capture(&ui_state, "auto-save", Some("autosave on exit"));
+                                if let Some(ref tid) = thread_id {
+                                    let mut cp_with_tag = cp;
+                                    cp_with_tag.tags.push(tid.clone());
+                                    if let Ok(json) = serde_json::to_string(&cp_with_tag) {
+                                        let _ = std::fs::write(&checkpoint_path, json);
+                                    }
+                                } else {
+                                    if let Ok(json) = serde_json::to_string(&cp) {
+                                        let _ = std::fs::write(&checkpoint_path, json);
+                                    }
+                                }
+                                stdin_shutdown.store(true, Ordering::Relaxed);
+                                let _ = terminal.disable_raw_mode();
+                                return Ok(());
+                            }
+                            "/clear" => {
+                                thread_id = None;
+                                ui_state.pending_tasks = 0;
+                                ui_state.pending_pushback = None;
+                                echo!("[conversation cleared]\r\n\r\n");
+                                continue;
+                            }
+                            "/status" => {
+                                let status = format!(
+                                    "thread: {} | tasks: {} | pushback: {}\r\n\r\n",
+                                    thread_id.as_deref().unwrap_or("none"),
+                                    ui_state.pending_tasks,
+                                    ui_state.pending_pushback.as_deref().unwrap_or("none"),
+                                );
+                                echo!("{}", status);
+                                continue;
+                            }
+                            "/help" => {
+                                echo!("/exit /quit /q — exit\r\n");
+                                echo!("/clear — clear conversation\r\n");
+                                echo!("/save — save session for resume\r\n");
+                                echo!("/status — show status\r\n");
+                                echo!("/paste — test paste detection\r\n");
+                                echo!("Type anytime during agent execution to correct it.\r\n");
+                                echo!("Corrections auto-send on period (.) or Enter.\r\n");
+                                echo!("\r\n");
+                                continue;
+                            }
+                            _ => {}
+                        }
+
+                        // ── Pushback: mid-execution correction ──────────
+                        if ui_state.pending_pushback.is_some() {
+                            let _ = pushback_tx.send(prompt.clone()).await;
+                            cancel_signal.notify_one();
+                            echo!("[pushback sent — agent will rethink]\r\n");
+                            continue;
+                        }
+
+                        // ── Normal prompt: submit to background task ────
+                        let tid = thread_id.clone();
+                        if let Err(_) = prompt_tx.send((prompt.clone(), tid)).await {
+                            echo!("[error: prompt queue full]\r\n\r\n");
+                        } else {
+                            ui_state.pending_tasks = ui_state.pending_tasks.saturating_add(1);
+                            echo!("[processing…]\r\n");
+                        }
                     }
-                    active_prompts += 1;
-                    echo!("[submitted — {} queued]\r\n", active_prompts);
+                    UiEvent::PasteContent { content, .. } => {
+                        echo!("{}", content);
+                    }
+                    _ => {}
                 }
-                UiEvent::PasteContent { content, .. } => {
-                    // Paste detected — echo and insert into input line
-                    input_line.push_str(&content);
-                    echo!("{}", content);
+            }
+
+            // ── Output from background task ──────────────────────────────
+            maybe_output = output_rx.recv() => {
+                let Some((text, is_error)) = maybe_output else { return Ok(()); };
+                ui_state.pending_tasks = ui_state.pending_tasks.saturating_sub(1);
+                if is_error {
+                    eprintln!("{}", text);
+                } else {
+                    println!("{}", text);
                 }
-                UiEvent::CtrlVPressed => {
-                    // Visual feedback during paste capture
-                    echo!("[pasting…]");
-                }
-                _ => {}
+                // Show quick status after response
+                let status = format!(
+                    "\r\x1b[K[{} tasks remaining]",
+                    ui_state.pending_tasks
+                );
+                echo!("{}", status);
+                println!();
             }
         }
     }
 }
+
+// ── Rich TUI (ratatui) ─────────────────────────────────────────────────
+// Drop-in replacement for run_tui using ratatui for proper terminal rendering.
+// Integrates the same channel-based pushback/processing backend with a
+// rich multi-pane terminal UI.
+pub async fn run_tui_rich(config_path: Option<PathBuf>) -> Result<()> {
+    use std::io;
+    use std::time::{Duration, Instant};
+    use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
+    use deepseek_tui_core::Pane;
+    use ratatui::{Terminal, backend::CrosstermBackend};
+
+    let opts = AppServerOptions {
+        listen: "127.0.0.1:0".parse().unwrap(),
+        config_path,
+        daemon: false,
+        pid_file: None,
+        auto_shutdown_idle: false,
+        idle_timeout_secs: 300,
+    };
+    // ── Streaming hook channel for real-time output ─────────────────────
+    let (stream_tx, mut stream_rx) = tokio::sync::mpsc::unbounded_channel::<HookEvent>();
+
+    let state = build_state(&opts, Some(stream_tx))?;
+    let mut ui_state = UiState::default();
+
+    // ── Channels (same as run_tui) ──────────────────────────────────────
+    let (prompt_tx, mut prompt_rx) = mpsc::channel::<(String, Option<String>)>(32);
+    let (output_tx, mut output_rx) = mpsc::channel::<(String, bool)>(64);
+    let (pushback_tx, mut pushback_rx) = mpsc::channel::<String>(16);
+    // Swarm agent status updates (Vec<AgentDisplay> or empty)
+    let (agents_tx, mut agents_rx) = mpsc::channel::<Vec<tui::widgets::agents::AgentDisplay>>(8);
+
+    // ── Periodic swarm status poller ─────────────────────────────────────
+    let swarm_ref = Arc::clone(&state.swarm);
+    tokio::spawn(async move {
+        loop {
+            tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+            let specs = swarm_ref.list_agents().await;
+            let displays: Vec<tui::widgets::agents::AgentDisplay> = specs.into_iter().map(|s| {
+                use tui::widgets::agents::AgentDisplayStatus;
+                tui::widgets::agents::AgentDisplay {
+                    id: s.id,
+                    role: s.role.label().to_string(),
+                    name: s.name,
+                    status: AgentDisplayStatus::Idle, // TODO: map from swarm agent status
+                    task: None,
+                    model: s.model,
+                }
+            }).collect();
+            if agents_tx.send(displays).await.is_err() { break; }
+        }
+    });
+
+    // ── Background prompt processor (same cancellable architecture) ─────
+    let bg_state = Arc::clone(&state.runtime);
+    tokio::spawn(async move {
+        let mut current_prompt: Option<(String, Option<String>)> = None;
+        let mut spawn_handle: Option<tokio::task::JoinHandle<()>>;
+        let mut accumulated_pushbacks: Vec<String> = Vec::new();
+
+        loop {
+            while let Ok(pb) = pushback_rx.try_recv() {
+                accumulated_pushbacks.push(pb);
+            }
+
+            let (mut prompt, thread_id) = if let Some((ref base_prompt, ref tid)) = current_prompt {
+                if accumulated_pushbacks.is_empty() {
+                    match prompt_rx.recv().await {
+                        Some(p) => { current_prompt = Some((p.0.clone(), p.1.clone())); p }
+                        None => break,
+                    }
+                } else {
+                    let pb_text = accumulated_pushbacks.join("\n");
+                    accumulated_pushbacks.clear();
+                    let merged = merge_prompt_with_pushbacks(base_prompt.clone(), &[pb_text]);
+                    (merged, tid.clone())
+                }
+            } else {
+                match prompt_rx.recv().await {
+                    Some(p) => { current_prompt = Some((p.0.clone(), p.1.clone())); p }
+                    None => break,
+                }
+            };
+
+            while let Ok(pb) = pushback_rx.try_recv() {
+                accumulated_pushbacks.push(pb);
+            }
+            if !accumulated_pushbacks.is_empty() {
+                let pb_text = accumulated_pushbacks.join("\n");
+                accumulated_pushbacks.clear();
+                prompt = merge_prompt_with_pushbacks(prompt, &[pb_text]);
+            }
+
+            let _ = output_tx.send(("⏳ thinking…".to_string(), false)).await;
+
+            let req = PromptRequest { thread_id: thread_id.clone(), prompt: prompt.clone(), model: None };
+            let rt_clone = Arc::clone(&bg_state);
+            let output_clone = output_tx.clone();
+
+            let (done_tx, mut done_rx) = tokio::sync::oneshot::channel();
+            spawn_handle = Some(tokio::spawn(async move {
+                let mut rt = rt_clone.lock().await;
+                let result = rt.handle_prompt(req, &CliRuntimeOverrides::default()).await;
+                let _ = done_tx.send(result);
+            }));
+
+            let completed = tokio::select! {
+                result = (&mut done_rx) => {
+                    match result {
+                        Ok(Ok(resp)) => {
+                            let _ = output_clone.send((
+                                format!("[model: {}]\n{}", resp.model, resp.output), false,
+                            )).await;
+                        }
+                        Ok(Err(e)) => {
+                            let _ = output_clone.send((format!("[error: {e}]"), true)).await;
+                        }
+                        Err(_) => {
+                            let _ = output_clone.send(("[agent task cancelled]".to_string(), true)).await;
+                        }
+                    }
+                    true
+                }
+                pb = pushback_rx.recv() => {
+                    if let Some(pb_text) = pb { accumulated_pushbacks.push(pb_text); }
+                    if let Some(h) = spawn_handle.take() { h.abort(); }
+                    let _ = output_clone.send(("[correction received — rethinking…]".to_string(), false)).await;
+                    false
+                }
+            };
+
+            if completed { current_prompt = None; }
+        }
+    });
+
+    // ── Session auto-resume ─────────────────────────────────────────────
+    let home = std::env::var("HOME")
+        .or_else(|_| std::env::var("USERPROFILE"))
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| PathBuf::from("."));
+    let checkpoint_path = home.join(".deepseek").join("tui_checkpoint.json");
+    if checkpoint_path.exists() {
+        if let Ok(data) = std::fs::read_to_string(&checkpoint_path) {
+            if let Ok(cp) = serde_json::from_str::<Checkpoint>(&data) {
+                // Auto-resume in rich mode: restore state silently
+                cp.restore(&mut ui_state);
+                let _ = std::fs::remove_file(&checkpoint_path);
+            }
+        }
+    }
+
+    let mut thread_id: Option<String> = None;
+
+    // ── Ratatui terminal setup ──────────────────────────────────────────
+    crossterm::terminal::enable_raw_mode()?;
+    let mut stdout = io::stdout();
+    crossterm::execute!(stdout, crossterm::terminal::EnterAlternateScreen)?;
+    let backend = CrosstermBackend::new(stdout);
+    let mut terminal = Terminal::new(backend)?;
+
+    // ── TUI app state ───────────────────────────────────────────────────
+    let mut tui = tui::app::TuiApp::new();
+    let tick = Duration::from_millis(100); // 10 FPS
+    let mut last_tick = Instant::now();
+
+    // ── Ratatui event loop ──────────────────────────────────────────────
+    let running = true;
+    let result: Result<()> = loop {
+        if !running { break Ok(()); }
+
+        // Check for output from background processor
+        while let Ok((text, is_error)) = output_rx.try_recv() {
+            if text.starts_with("[correction received") || text.starts_with("⏳ thinking") {
+                tui.streaming = true;
+                continue;
+            }
+            let role = if is_error { tui::widgets::chat::MessageRole::Error }
+                else { tui::widgets::chat::MessageRole::Assistant };
+            tui.add_message(role, text);
+            tui.streaming = false;
+            tui.scroll_to_bottom();
+            ui_state.pending_tasks = ui_state.pending_tasks.saturating_sub(1);
+        }
+
+        // Check for swarm agent status updates
+        while let Ok(agents) = agents_rx.try_recv() {
+            tui.agents.agents = agents;
+        }
+
+        // Process streaming hook events (real-time text deltas + tool calls)
+        while let Ok(event) = stream_rx.try_recv() {
+            match event {
+                HookEvent::ResponseStart { .. } => {
+                    tui.streaming = true;
+                }
+                HookEvent::ResponseDelta { delta, .. } => {
+                    // Append delta to the last assistant message or create one
+                    tui.chat.streaming_text.push_str(&delta);
+                }
+                HookEvent::ToolLifecycle { tool_name, phase, .. } => {
+                    if phase == "start" {
+                        tui.add_message(
+                            tui::widgets::chat::MessageRole::Tool,
+                            format!("🔧 running {}", tool_name),
+                        );
+                    } else if phase == "end" {
+                        tui.add_message(
+                            tui::widgets::chat::MessageRole::Tool,
+                            format!("✅ completed {}", tool_name),
+                        );
+                    }
+                }
+                HookEvent::ResponseEnd { .. } => {
+                    // Flush streaming text to a real message
+                    let streamed = std::mem::take(&mut tui.chat.streaming_text);
+                    if !streamed.is_empty() {
+                        tui.add_message(
+                            tui::widgets::chat::MessageRole::Assistant,
+                            streamed,
+                        );
+                    }
+                    tui.streaming = false;
+                    tui.scroll_to_bottom();
+                }
+                _ => {}
+            }
+        }
+
+        // Poll for input
+        if event::poll(tick)? {
+            if let Event::Key(key) = event::read()? {
+                if key.kind == KeyEventKind::Press || key.kind == KeyEventKind::Repeat {
+                    match key.code {
+                        KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                            // Auto-save and exit
+                            let cp = Checkpoint::capture(&ui_state, "auto-save", Some("autosave on exit"));
+                            if let Some(ref tid) = thread_id {
+                                let mut c = cp; c.tags.push(tid.clone());
+                                if let Ok(json) = serde_json::to_string(&c) { let _ = std::fs::write(&checkpoint_path, json); }
+                            } else {
+                                if let Ok(json) = serde_json::to_string(&cp) { let _ = std::fs::write(&checkpoint_path, json); }
+                            }
+                            break Ok(());
+                        }
+                        KeyCode::Enter => {
+                            // Only process input in Chat pane; in other panes, Enter switches to Chat
+                            if tui.active_pane != Pane::Chat {
+                                tui.switch_pane(Pane::Chat);
+                                continue;
+                            }
+                            let prompt = tui.chat.input.trim().to_string();
+                            tui.chat.input.clear();
+                            if prompt.is_empty() { continue; }
+
+                            // Slash commands
+                            match prompt.as_str() {
+                                "/exit" | "/quit" | "/q" => {
+                                    let cp = Checkpoint::capture(&ui_state, "auto-save", Some("autosave on exit"));
+                                    if let Some(ref tid) = thread_id {
+                                        let mut c = cp; c.tags.push(tid.clone());
+                                        if let Ok(json) = serde_json::to_string(&c) { let _ = std::fs::write(&checkpoint_path, json); }
+                                    }
+                                    break Ok(());
+                                }
+                                "/clear" => {
+                                    thread_id = None;
+                                    tui.chat.messages.clear();
+                                    tui.chat.input.clear();
+                                    ui_state.pending_tasks = 0;
+                                    continue;
+                                }
+                                "/diff" => {
+                                    if let Ok(output) = std::process::Command::new("git")
+                                        .args(["diff", "--color=never"]).output()
+                                    {
+                                        tui.diff.load_diff(&String::from_utf8_lossy(&output.stdout));
+                                    }
+                                    tui.switch_pane(Pane::Diff);
+                                    continue;
+                                }
+                                "/swarm" => {
+                                    // Trigger immediate agent list refresh
+                                    let specs = state.swarm.list_agents().await;
+                                    let displays: Vec<tui::widgets::agents::AgentDisplay> = specs.into_iter().map(|s| {
+                                        use tui::widgets::agents::AgentDisplayStatus;
+                                        tui::widgets::agents::AgentDisplay {
+                                            id: s.id, role: s.role.label().to_string(), name: s.name,
+                                            status: AgentDisplayStatus::Idle, task: None, model: s.model,
+                                        }
+                                    }).collect();
+                                    tui.agents.agents = displays;
+                                    tui.switch_pane(Pane::Agents);
+                                    continue;
+                                }
+                                "/tasks" => {
+                                    load_gsd_tasks(&mut tui);
+                                    tui.switch_pane(Pane::Tasks);
+                                    continue;
+                                }
+                                "/save" => {
+                                    let cp = Checkpoint::capture(&ui_state, "manual-save", Some("user save"));
+                                    let mut c = cp;
+                                    if let Some(ref tid) = thread_id { c.tags.push(tid.clone()); }
+                                    if let Ok(json) = serde_json::to_string(&c) { let _ = std::fs::write(&checkpoint_path, json); }
+                                    tui.add_message(tui::widgets::chat::MessageRole::System, "Session saved.".into());
+                                    continue;
+                                }
+                                _ => {}
+                            }
+
+                            // Pushback or new prompt
+                            if ui_state.pending_pushback.is_some() || tui.streaming {
+                                let _ = pushback_tx.send(prompt.clone()).await;
+                                tui.add_message(tui::widgets::chat::MessageRole::System, format!("Correction sent: {}", prompt));
+                            } else {
+                                tui.add_message(tui::widgets::chat::MessageRole::User, prompt.clone());
+                                let tid = thread_id.clone();
+                                if prompt_tx.send((prompt, tid)).await.is_err() {
+                                    tui.add_message(tui::widgets::chat::MessageRole::Error, "Prompt queue full.".into());
+                                } else {
+                                    ui_state.pending_tasks = ui_state.pending_tasks.saturating_add(1);
+                                    tui.streaming = true;
+                                }
+                            }
+                            tui.round_count += 1;
+                            tui.scroll_to_bottom();
+                        }
+                        KeyCode::Backspace => {
+                            tui.chat.input.pop();
+                        }
+                        // ── Pane switching via number keys ──────────────────
+                        KeyCode::Char('1') => tui.switch_pane(Pane::Chat),
+                        KeyCode::Char('2') => {
+                            // Load git diff on switch to Diff pane
+                            if tui.active_pane != Pane::Diff {
+                                if let Ok(output) = std::process::Command::new("git")
+                                    .args(["diff", "--color=never"])
+                                    .output()
+                                {
+                                    let diff_text = String::from_utf8_lossy(&output.stdout);
+                                    tui.diff.load_diff(&diff_text);
+                                }
+                            }
+                            tui.switch_pane(Pane::Diff);
+                        }
+                        KeyCode::Char('3') => {
+                            // Load tasks from GSD planning on switch
+                            if tui.active_pane != Pane::Tasks && tui.tasks.tasks.is_empty() {
+                                load_gsd_tasks(&mut tui);
+                            }
+                            tui.switch_pane(Pane::Tasks);
+                        }
+                        KeyCode::Char('4') => tui.switch_pane(Pane::Agents),
+                        KeyCode::Char('5') => tui.switch_pane(Pane::Jobs),
+                        // ── Text input (Chat pane only) ────────────────────
+                        KeyCode::Char(ch) => {
+                            if tui.active_pane == Pane::Chat {
+                                tui.chat.input.push(ch);
+                                // Auto-pushback on period during execution
+                                if tui.streaming && ch == '.' && tui.chat.input.trim().len() > 3 {
+                                    let correction = tui.chat.input.trim().to_string();
+                                    let _ = pushback_tx.try_send(correction);
+                                }
+                            }
+                        }
+                        // ── Scroll (routes to active pane) ────────────────
+                        KeyCode::Up => { let o = tui.active_scroll_offset_mut(); *o = o.saturating_add(1); }
+                        KeyCode::Down => { let o = tui.active_scroll_offset_mut(); *o = o.saturating_sub(1); }
+                        KeyCode::PageUp => { let o = tui.active_scroll_offset_mut(); *o = o.saturating_add(10); }
+                        KeyCode::PageDown => { let o = tui.active_scroll_offset_mut(); *o = o.saturating_sub(10); }
+                        _ => {}
+                    }
+                }
+            }
+        }
+
+        // Periodic UI state sync
+        if last_tick.elapsed() >= tick {
+            tui.mode = ui_state.mode;
+            tui.budget.used_tokens = ((1.0 - ui_state.context_budget.pct_remaining()) * ui_state.context_budget.total_tokens as f64) as usize;
+            last_tick = Instant::now();
+        }
+
+        // Render frame
+        terminal.draw(|f| tui.render(f))?;
+    };
+
+    // ── Restore terminal ────────────────────────────────────────────────
+    crossterm::terminal::disable_raw_mode()?;
+    crossterm::execute!(terminal.backend_mut(), crossterm::terminal::LeaveAlternateScreen)?;
+    terminal.show_cursor()?;
+
+    result
+}
+
+// ── Helper: merge pushbacks into prompt ───────────────────────────────────
+fn merge_prompt_with_pushbacks(prompt: String, pushbacks: &[String]) -> String {
+    if pushbacks.is_empty() {
+        return prompt;
+    }
+    let corrections = pushbacks.join("\n");
+    format!("{}\n\n[USER CORRECTION (mid-execution)]: {}", prompt, corrections)
+}
+
+// ── Helper: process UiEffects from the state machine ──────────────────────
+fn process_effects(effects: &EffectVec, ui_state: &mut UiState) {
+    for effect in effects {
+        match effect {
+            UiEffect::Render => { /* no-op: live-echo handles rendering */ }
+            UiEffect::EmitStatusLine(line) => {
+                ui_state.status_line = line.clone();
+            }
+            UiEffect::PushbackDraft(pb) => {
+                ui_state.pending_pushback = Some(pb.clone());
+            }
+            _ => {}
+        }
+    }
+}
+
 
 async fn dispatch_stdio(state: &AppState, method: &str, params: Value) -> std::result::Result<StdioDispatchResult, JsonRpcError> {
     match method {
@@ -744,9 +1433,25 @@ async fn process_app_request(state: &AppState, req: AppRequest) -> AppResponse {
     }
 }
 
+
+// ── Channel-based hook sink for real-time TUI streaming ──────────────────
+
+struct ChannelHookSink {
+    tx: tokio::sync::mpsc::UnboundedSender<HookEvent>,
+}
+
+#[async_trait]
+impl HookSink for ChannelHookSink {
+    async fn emit(&self, event: &HookEvent) -> anyhow::Result<()> {
+        // Ignore send errors — receiver was dropped (TUI closed)
+        let _ = self.tx.send(event.clone());
+        Ok(())
+    }
+}
+
 // ── State construction ─────────────────────────────────────────────────────
 
-fn build_state(options: &AppServerOptions) -> Result<AppState> {
+fn build_state(options: &AppServerOptions, hook_stream_tx: Option<tokio::sync::mpsc::UnboundedSender<deepseek_hooks::HookEvent>>) -> Result<AppState> {
     let store = ConfigStore::load(options.config_path.clone())?;
     let config = store.config.clone();
     let registry = ModelRegistry::default();
@@ -756,6 +1461,10 @@ fn build_state(options: &AppServerOptions) -> Result<AppState> {
     hooks.add_sink(Arc::new(StdoutHookSink));
     let hl = options.config_path.as_ref().and_then(|p| p.parent().map(|x| x.join("events.jsonl"))).unwrap_or_else(|| PathBuf::from(".deepseek/events.jsonl"));
     hooks.add_sink(Arc::new(JsonlHookSink::new(hl)));
+    // Optional streaming hook sink for TUI real-time output
+    if let Some(tx) = hook_stream_tx {
+        hooks.add_sink(Arc::new(ChannelHookSink { tx }));
+    }
     let runtime = Runtime::new(config.clone(), registry.clone(), state_store, Arc::new(ToolRegistry::default()), Arc::new(McpManager::default()), ExecPolicyEngine::new(vec![], vec![]), hooks);
     let session_store = match SessionStore::default_store() {
         Ok(s) => Arc::new(s),
@@ -811,4 +1520,59 @@ impl JsonRpcError {
     fn method_not_found(m: &str) -> Self { Self { code: -32601, message: format!("unsupported method: {m}"), data: None } }
     fn invalid_params(m: impl Into<String>) -> Self { Self { code: -32602, message: m.into(), data: None } }
     fn internal(m: impl Into<String>) -> Self { Self { code: -32603, message: m.into(), data: None } }
+}
+
+// ── Helper: load GSD tasks from .planning/ directory ────────────────────
+#[allow(dead_code)]
+fn load_gsd_tasks(tui: &mut tui::app::TuiApp) {
+    // Try to load tasks from the GSD planning directory
+    let planning_dir = PathBuf::from(".planning");
+    if !planning_dir.exists() {
+        // No planning dir — show empty state
+        tui.tasks.load_tasks(vec![]);
+        return;
+    }
+
+    // Try to read ROIADMAP.md or STATE.md for task information
+    let mut items = Vec::new();
+
+    // Check for ROADMAP.md
+    let roadmap_path = planning_dir.join("ROADMAP.md");
+    if roadmap_path.exists() {
+        if let Ok(content) = std::fs::read_to_string(&roadmap_path) {
+            for line in content.lines() {
+                let trimmed = line.trim();
+                if trimmed.starts_with("- [ ]") {
+                    let title = trimmed.replacen("- [ ]", "", 1).trim().to_string();
+                    items.push((title, "pending".to_string(), "roadmap".to_string()));
+                } else if trimmed.starts_with("- [x]") || trimmed.starts_with("- [X]") {
+                    let title = trimmed.replacen("- [x]", "", 1).replacen("- [X]", "", 1).trim().to_string();
+                    items.push((title, "completed".to_string(), "roadmap".to_string()));
+                }
+            }
+        }
+    }
+
+    // Check for STATE.md blockers
+    let state_path = planning_dir.join("STATE.md");
+    if state_path.exists() {
+        if let Ok(content) = std::fs::read_to_string(&state_path) {
+            let mut in_blockers = false;
+            for line in content.lines() {
+                if line.contains("Blockers") || line.contains("blockers") {
+                    in_blockers = true;
+                    continue;
+                }
+                if in_blockers && (line.starts_with('-') || line.starts_with('*')) {
+                    if line.is_empty() { in_blockers = false; continue; }
+                    let title = line.trim_start_matches(&['-', '*', ' '][..]).trim().to_string();
+                    if !title.is_empty() {
+                        items.push((title, "blocked".to_string(), "blocker".to_string()));
+                    }
+                }
+            }
+        }
+    }
+
+    tui.tasks.load_tasks(items);
 }
