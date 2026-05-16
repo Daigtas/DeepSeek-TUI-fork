@@ -122,7 +122,7 @@ fn print_dashboard(host: &str, port: u16) {
 
 fn main() -> Result<()> {
     let cli = Cli::parse();
-    let cmd = cli.command.unwrap_or(Command::Serve);
+    let cmd = cli.command.unwrap_or(Command::Tui);
 
     match cmd {
         Command::Serve => {
